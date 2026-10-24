@@ -21,6 +21,16 @@ CHECK(W2R_OK == 0);
 CHECK(W2R_E_DENIED < 0 && W2R_E_BUSY < 0);
 CHECK(W2R_HOST_CREATE_UI_SIZE > offsetof(W2rHost, symbol_address));
 CHECK(W2R_HOST_MAP_FOLDER_SIZE > offsetof(W2rHost, create_map_select));
+CHECK(W2R_HOST_SETTINGS_DECLARE_SIZE == sizeof(W2rHost));
+CHECK(W2R_HOST_SETTINGS_DECLARE_SIZE > W2R_HOST_MAP_FOLDER_SIZE);
+CHECK(offsetof(W2rSettingDef, struct_size) == 0);
+CHECK(offsetof(W2rSettingDef, default_int) == 8);
+CHECK(offsetof(W2rSettingDef, flags) == 32);
+CHECK(offsetof(W2rSettingDef, choices) == 40);
+CHECK(offsetof(W2rSettingDef, key) == (sizeof(void *) == 4 ? 48 : 56));
+CHECK(offsetof(W2rSettingDef, active_when) == (sizeof(void *) == 4 ? 96 : 152));
+CHECK(sizeof(W2rSettingDef) == (sizeof(void *) == 4 ? 104 : 168));
+CHECK(W2R_SETTING_DEF_V1_SIZE == sizeof(W2rSettingDef));
 CHECK(W2R_MAX_PEER_PAYLOAD + W2R_PEER_HEADER_BYTES <= 989);
 
 /* The smallest possible plugin must compile against the header. */

@@ -66,8 +66,10 @@ Implicit capabilities need no approval: `log`, `settings`, `ui`, `fs.data`.
 | `hook_install`, `hook_remove` | `hooks.raw` (shown as **dangerous**) | `target` is a `symbol_lookup` handle of a function symbol (`W2R_E_NOT_FOUND` for a bad handle, `W2R_E_INVALID` for a global), so a hook is always inside the game module's code; `original_out` receives the trampoline before the hook goes live; no overlap with any host patch or other hook (`W2R_E_CONFLICT`); at most 64 hooks per plugin |
 
 The UI (`W2rUi`) is passed to `on_ui` and is valid only inside that call. It offers `label`,
-`button`, `checkbox` and `slider_int`; each call draws one row in the plugin's section of the
-in-game plugin list (reached from the options screen). Strings are at most 128 bytes of UTF-8;
+`button`, `checkbox` and `slider_int`; each call draws one row in the plugin's card in the plugin
+manager (opened from the title screen). A plugin's settings belong in its declarations instead (next section), so
+they appear in the options screen's categories with everyone else's; `on_ui` remains for what a
+declaration cannot express. Strings are at most 128 bytes of UTF-8;
 a longer or invalid string, a null value pointer or `min >= max` makes the call a no-op that
 reports 0. `button` returns 1 when pressed this frame; `checkbox` and `slider_int` return 1 when
 they changed the value this frame (the slider clamps it to the range first). `ctx` is opaque.
@@ -83,6 +85,48 @@ Two calls were appended after the first release (`struct_size` grew; a plugin ch
   game's edit filter applies); the plugin must validate it.
 - `set_active(ctx, active)`: 0 greys out and disables the rows that follow, 1 restores them. A
   grey-out left open at the end of `on_ui` is closed by the host.
+
+## Declared settings
+
+Appended after `create_map_folder` (`host->struct_size >= W2R_HOST_SETTINGS_DECLARE_SIZE`; an
+older host has a smaller table). Implicit, no capability. The options screen
+([settings-screen.md](settings-screen.md)) shows every setting the game, the host and the plugins
+have in one place: categories down the left, the selected category's settings on the right grouped
+under subcategory headings, a search page, and the description on hover. A plugin puts its own
+settings there by declaring them.
+
+`settings_declare(token, def)` declares one setting. It is accepted only while the plugin's
+`on_load` runs (`W2R_E_STATE` after), and every string in `def` is copied during the call.
+
+| Field | Rule |
+|---|---|
+| `struct_size` | at least `W2R_SETTING_DEF_V1_SIZE` (`W2R_E_INVALID` otherwise) |
+| `reserved` | 0 (`W2R_E_INVALID` otherwise) |
+| `kind` | `W2R_SETTING_BOOL` (a checkbox, stored with `settings_set_i64` as 0 or 1), `_INT` (a slider when `min < max`, a read-only row otherwise), `_CHOICE` (a dropdown, stored as the chosen index), `_STRING` (a text box, `settings_set_str`) or `_COLOR` (a color picker, stored with `settings_set_str` as six lowercase hex digits, `rrggbb`); anything else `W2R_E_INVALID` |
+| `flags` | 0, or `W2R_SETTING_HIDDEN`: stored and readable as usual, never shown; other bits `W2R_E_INVALID` |
+| `key` | the settings-key rule above; declared once per plugin (`W2R_E_CONFLICT` the second time); at most 128 declarations, the same cap as stored keys |
+| `label` | 1 to 64 bytes. Title Case, like the rest of the screen |
+| `description` | at most 256 bytes; may be empty. The hover text. The tooltip's last line names the plugin (its manifest `name`) |
+| `category`, `subcategory` | at most 32 bytes each. Several plugins may name the same category, which is the point: related settings end up together. An empty category is the plugin's name; an empty subcategory is "General" |
+| `default_int` | 64-bit, like the stored value. 0 or 1 for a bool, a value in `[min, max]` for a slider, an index into `choices` for a choice (`W2R_E_INVALID` otherwise) |
+| `min`, `max` | 64-bit; `_INT` only; `min > max` is `W2R_E_INVALID` |
+| `default_str` | `_STRING`: at most 1,024 bytes. `_COLOR`: six hex digits without `#` (`W2R_E_INVALID` otherwise) |
+| `choices`, `choice_count` | `_CHOICE` only: 2 to 16 labels of 1 to 64 bytes (`W2R_E_LIMIT` above 16, `W2R_E_INVALID` below 2) |
+| `active_when` | empty, or the key of a `_BOOL` this plugin declared earlier, or `host:<key>` for one of the host's own bools (for example `host:enhanced_create_screen`). The row is greyed while that checkbox is off. An unknown key is `W2R_E_NOT_FOUND`, a non-bool `W2R_E_INVALID` |
+
+The host reads only the fields the kind uses, so the others may be left uninitialised; the
+field order keeps every offset the same under any 32-bit compiler. Every text field is printable
+ASCII (the screen draws through the game's font atlas, which has no other glyphs): anything else
+is `W2R_E_INVALID`, and an over-long field `W2R_E_LIMIT`. A refused declaration is logged with
+its key and status.
+
+Values stay where they always were, in `config\<plugin-id>.json`, and the plugin reads them with
+`settings_get_i64` / `settings_get_str` as before. A declared key that was never stored reads as
+its declared default (instead of `W2R_E_NOT_FOUND`). The screen writes a plugin's values only
+when the player presses Apply or Save and Exit, so a plugin never sees a half-made edit; then it
+sends the plugin `W2R_EVT_SETTINGS_CHANGED`, once per apply, after all of that plugin's changed
+values are stored. A plugin that subscribed to it re-reads its settings there. Values the plugin
+stores itself with `settings_set_*` are what the screen shows the next time it opens.
 
 ## Create screen
 
@@ -141,7 +185,7 @@ messages per second has the excess dropped before any plugin sees them.
 | `W2R_EVT_PEER_MESSAGE` 6 | `W2rEvtPeerMessage` | `net.send` | a plugin message with this plugin's tag arrives |
 | `W2R_EVT_MATCH_START` 7 | none | none | a match begins (the game resets its map-message slots, as wc2r-plus detects it); delivered before the game's own reset runs |
 | `W2R_EVT_MATCH_END` 8 | none | none | the local player's `PlayerMatchResult` became non-zero (victory, defeat or leaving), once per match; fired from a host hook on `CheckMatchEnd` after the game's own function ran |
-| `W2R_EVT_SETTINGS_CHANGED` 9 | none | none | the user changed this plugin's settings in the UI |
+| `W2R_EVT_SETTINGS_CHANGED` 9 | none | none | the options screen stored new values for this plugin's declared settings (Apply or Save and Exit), once per apply |
 | `W2R_EVT_SHUTDOWN` 10 | none | none | the game is exiting |
 
 `subscribe` for an event whose capability is not approved returns `W2R_E_DENIED`. New events are
@@ -195,7 +239,7 @@ Plugins send through `peer_send`; the host builds the envelope:
 - `on_unload` is best effort and may be skipped after a fault. The host never relies on it to keep
   its own state consistent.
 - The host cannot preempt a slow callback. It logs callbacks over 50 ms, and after 10 in a row the
-  plugin list shows a slow-plugin warning.
+  plugin manager shows the plugin's status as slow.
 
 ## Minimal plugin
 

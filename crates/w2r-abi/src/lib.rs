@@ -74,6 +74,12 @@ pub const W2R_MAX_IO_BYTES: u32 = 65536;
 pub const W2R_MAX_SYMBOL_NAME: u32 = 64;
 pub const W2R_MAX_READ_BYTES: u32 = 4096;
 pub const W2R_MAX_CHAT_BYTES: u32 = 200;
+
+pub const W2R_MAX_SETTING_LABEL: u32 = 64;
+pub const W2R_MAX_SETTING_DESCRIPTION: u32 = 256;
+pub const W2R_MAX_SETTING_CATEGORY: u32 = 32;
+pub const W2R_MAX_SETTING_CHOICE: u32 = 64;
+pub const W2R_MAX_SETTING_CHOICE_COUNT: u32 = 16;
 /// 0xE7 'W' '2' 'R' 'P' tag[4]
 pub const W2R_PEER_HEADER_BYTES: u32 = 9;
 pub const W2R_MAX_PEER_PAYLOAD: u32 = 960;
@@ -287,7 +293,74 @@ pub struct W2rHost {
     /// the callback returns, so call this first, every frame. A folder with no maps gives a count
     /// of 0.
     pub create_map_folder: unsafe extern "C" fn(token: *mut c_void, folder: W2rStr) -> W2rStatus,
+
+    // Appended after `create_map_folder`: check `struct_size >= W2R_HOST_SETTINGS_DECLARE_SIZE`.
+    /// Only inside `on_load`. Declares one of the plugin's own settings, so the host's options
+    /// screen shows it under `category` / `subcategory` with the right widget and hover text, and
+    /// edits it for the plugin. The value is stored as before (`settings_get_*` read it, and a
+    /// declared key that was never stored reads as its default); the plugin hears of a change
+    /// through `W2R_EVT_SETTINGS_CHANGED`. docs/abi.md, "Declared settings".
+    pub settings_declare:
+        unsafe extern "C" fn(token: *mut c_void, def: *const W2rSettingDef) -> W2rStatus,
 }
+
+// ---- declared settings ----------------------------------------------------------------------
+/// A checkbox. Stored with `settings_set_i64` as 0 or 1.
+pub const W2R_SETTING_BOOL: u32 = 0;
+/// A whole number, `settings_set_i64`. A slider when `min < max`, a read-only row otherwise.
+pub const W2R_SETTING_INT: u32 = 1;
+/// A dropdown over `choices`. Stored with `settings_set_i64` as the chosen index.
+pub const W2R_SETTING_CHOICE: u32 = 2;
+/// A text box, `settings_set_str`.
+pub const W2R_SETTING_STRING: u32 = 3;
+/// A color picker. Stored with `settings_set_str` as six lowercase hex digits, `rrggbb`.
+pub const W2R_SETTING_COLOR: u32 = 4;
+
+/// `W2rSettingDef.flags`: loaded, saved and readable as usual, but not shown on the screen.
+pub const W2R_SETTING_HIDDEN: u32 = 1;
+
+/// One setting, as `settings_declare` takes it. Every string is copied during the call, and fields
+/// a kind does not use are ignored. The order keeps every field at the same offset under any 32-bit
+/// compiler: each 64-bit field is 8-aligned and the size is a multiple of 8.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct W2rSettingDef {
+    /// `W2R_SETTING_DEF_V1_SIZE`.
+    pub struct_size: u32,
+    /// `W2R_SETTING_BOOL`, `_INT`, `_CHOICE`, `_STRING` or `_COLOR`.
+    pub kind: u32,
+    /// The default: 0 or 1 for a bool, the number for an int, the index for a choice.
+    pub default_int: i64,
+    /// `W2R_SETTING_INT` only: the slider's range, inclusive. `min == max` draws no slider.
+    pub min: i64,
+    pub max: i64,
+    /// `W2R_SETTING_HIDDEN` or 0.
+    pub flags: u32,
+    pub choice_count: u32,
+    /// `W2R_SETTING_CHOICE` only: 2 to `W2R_MAX_SETTING_CHOICE_COUNT` labels, in dropdown order.
+    pub choices: *const W2rStr,
+    /// Must be 0.
+    pub reserved: u32,
+    /// The settings key, under the same rule as `settings_set_*`.
+    pub key: W2rStr,
+    /// What the row says. Title Case, like the rest of the screen.
+    pub label: W2rStr,
+    /// Shown when the mouse is over the row; may be empty.
+    pub description: W2rStr,
+    /// The entry in the screen's left-hand list (`"Chat"`); empty uses the plugin's name. Several
+    /// plugins may share one, which is the point: similar settings end up together.
+    pub category: W2rStr,
+    /// The heading inside the category (`"Behavior"`); empty uses `"General"`.
+    pub subcategory: W2rStr,
+    /// `W2R_SETTING_STRING`: the default text. `W2R_SETTING_COLOR`: the default, `rrggbb`.
+    pub default_str: W2rStr,
+    /// Greys the row out while a checkbox is off: the key of a `W2R_SETTING_BOOL` this plugin
+    /// declared earlier, or `host:<key>` for one of the host's own. Empty = always active.
+    pub active_when: W2rStr,
+}
+
+/// `W2rSettingDef.struct_size` of the first version.
+pub const W2R_SETTING_DEF_V1_SIZE: u32 = core::mem::size_of::<W2rSettingDef>() as u32;
 
 // ---- plugin table: returned by the plugin --------------------------------------------------
 /// Callbacks are `Option` because a plugin may leave any of them NULL; the host checks
@@ -317,7 +390,10 @@ pub const W2R_HOST_V1_SIZE: u32 =
 pub const W2R_HOST_CREATE_UI_SIZE: u32 =
     (core::mem::offset_of!(W2rHost, create_map_select) + core::mem::size_of::<usize>()) as u32;
 /// `struct_size` of a host that also has `create_map_folder`.
-pub const W2R_HOST_MAP_FOLDER_SIZE: u32 = core::mem::size_of::<W2rHost>() as u32;
+pub const W2R_HOST_MAP_FOLDER_SIZE: u32 =
+    (core::mem::offset_of!(W2rHost, create_map_folder) + core::mem::size_of::<usize>()) as u32;
+/// `struct_size` of a host that also has `settings_declare`.
+pub const W2R_HOST_SETTINGS_DECLARE_SIZE: u32 = core::mem::size_of::<W2rHost>() as u32;
 
 // Mirrors tests/abi_layout.c. Keep both in sync.
 const _: () = {
@@ -334,6 +410,12 @@ const _: () = {
     assert!(W2R_OK == 0);
     assert!(W2R_E_DENIED < 0 && W2R_E_BUSY < 0);
     assert!(W2R_MAX_PEER_PAYLOAD + W2R_PEER_HEADER_BYTES <= 989);
+    assert!(offset_of!(W2rSettingDef, struct_size) == 0);
+    assert!(offset_of!(W2rSettingDef, default_int) == 8);
+    assert!(offset_of!(W2rSettingDef, flags) == 32);
+    assert!(offset_of!(W2rSettingDef, choices) == 40);
+    assert!(offset_of!(W2rSettingDef, key) == if size_of::<usize>() == 4 { 48 } else { 56 });
+    assert!(offset_of!(W2rSettingDef, active_when) == if size_of::<usize>() == 4 { 96 } else { 152 });
     // Option<fn> must be pointer-sized with NULL as None for the plugin table to match C.
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
 };
@@ -343,7 +425,7 @@ mod tests {
     use super::*;
     use core::mem::size_of;
 
-    // The game target. 17 host function pointers after a 12-byte header.
+    // The game target. 23 host function pointers after a 12-byte header.
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn sizes_match_the_c_header_on_x86() {
@@ -351,11 +433,13 @@ mod tests {
         assert_eq!(size_of::<W2rEvent>(), 12);
         assert_eq!(size_of::<W2rPlugin>(), 20);
         assert_eq!(size_of::<W2rUi>(), 32);
-        assert_eq!(size_of::<W2rHost>(), 100);
+        assert_eq!(size_of::<W2rHost>(), 104);
         assert_eq!(W2R_HOST_V1_SIZE, 84);
         assert_eq!(W2R_PLUGIN_V1_SIZE, 20);
         assert_eq!(W2R_HOST_CREATE_UI_SIZE, 96);
         assert_eq!(W2R_HOST_MAP_FOLDER_SIZE, 100);
+        assert_eq!(W2R_HOST_SETTINGS_DECLARE_SIZE, 104);
+        assert_eq!(size_of::<W2rSettingDef>(), 104);
     }
 
     // Not a shipping target, but the tests run here too; pointer alignment pads the u32 headers.
@@ -366,6 +450,8 @@ mod tests {
         assert_eq!(size_of::<W2rEvent>(), 16);
         assert_eq!(size_of::<W2rPlugin>(), 40);
         assert_eq!(size_of::<W2rUi>(), 64);
-        assert_eq!(size_of::<W2rHost>(), 192);
+        assert_eq!(size_of::<W2rHost>(), 200);
+        assert_eq!(W2R_HOST_MAP_FOLDER_SIZE, 192);
+        assert_eq!(size_of::<W2rSettingDef>(), 168);
     }
 }

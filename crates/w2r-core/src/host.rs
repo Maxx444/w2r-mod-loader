@@ -24,6 +24,7 @@ use crate::peer::{
     self, NoPeers, NoTransport, Nowhere, Presence, Roster, SlidingWindow, Target, TargetError,
     Transport,
 };
+use crate::settings::{self, DeclaredSetting, SettingDef};
 use crate::store::{DataDir, DataError, SetError, Settings, Val};
 use crate::symbols::Symbols;
 use crate::target::Kind;
@@ -150,6 +151,11 @@ pub struct Slot {
     slow: Cell<u32>,
     /// The callback from `create_ui_register`, if any.
     create_ui: Cell<Option<CreateUiFn>>,
+    /// True only while the plugin's `on_load` runs: `settings_declare` is refused elsewhere.
+    loading: Cell<bool>,
+    /// What the plugin declared with `settings_declare`, in order. Its `category` is empty
+    /// where the plugin named none; the session fills the plugin's display name in.
+    declared: RefCell<Vec<SettingDef>>,
     shared: Rc<Shared>,
     host: W2rHost,
 }
@@ -178,6 +184,8 @@ impl Slot {
             tag: peer::peer_tag(id),
             slow: Cell::new(0),
             create_ui: Cell::new(None),
+            loading: Cell::new(false),
+            declared: RefCell::new(Vec::new()),
             shared,
             host: host_table(core::ptr::null_mut()),
         });
@@ -225,6 +233,31 @@ impl Slot {
 
     pub fn is_active(&self) -> bool {
         matches!(&*self.state.borrow(), State::Active)
+    }
+
+    /// Marks the span of `on_load`, the only time `settings_declare` is accepted.
+    pub fn set_loading(&self, loading: bool) {
+        self.loading.set(loading);
+    }
+
+    /// The settings the plugin declared (docs/abi.md, "Declared settings").
+    pub fn declared(&self) -> Vec<SettingDef> {
+        self.declared.borrow().clone()
+    }
+
+    /// One of the plugin's stored values, for the options screen. `None` when the key was never
+    /// stored, or there is no settings folder.
+    pub fn stored_setting(&self, key: &str) -> Option<Val> {
+        cb::with_settings(self, |s| Ok(s.get(key).cloned()))
+            .ok()
+            .flatten()
+    }
+
+    /// Stores one value for the plugin, as `settings_set_*` would, when the player applies the
+    /// options screen.
+    pub fn store_setting(&self, key: &str, value: Val) -> Result<(), String> {
+        cb::with_settings(self, |s| s.set(key, value).map_err(cb::set_status))
+            .map_err(|status| format!("cannot save setting {key} ({status})"))
     }
 
     pub fn subscribed(&self, id: W2rEventId) -> bool {
@@ -292,7 +325,7 @@ impl Slot {
 
 fn host_table(token: *mut c_void) -> W2rHost {
     W2rHost {
-        struct_size: W2R_HOST_MAP_FOLDER_SIZE,
+        struct_size: W2R_HOST_SETTINGS_DECLARE_SIZE,
         abi_version: W2R_ABI_VERSION,
         token,
         log: cb::log,
@@ -317,6 +350,7 @@ fn host_table(token: *mut c_void) -> W2rHost {
         create_map_count: cb::create_map_count,
         create_map_select: cb::create_map_select,
         create_map_folder: cb::create_map_folder,
+        settings_declare: cb::settings_declare,
     }
 }
 
@@ -751,6 +785,125 @@ mod cb {
         })
     }
 
+    /// The default of a declared key, for a read of a key that was never stored.
+    fn declared_default(slot: &Slot, key: &str) -> Option<Val> {
+        let declared = slot.declared.borrow();
+        let d = declared.iter().find(|d| d.key == key)?;
+        Some(match d.default_value() {
+            settings::Value::Str(s) => Val::Str(s),
+            settings::Value::Int(n) => Val::Int(n),
+        })
+    }
+
+    /// Copies one `W2rStr` out of a declaration, refusing anything over `max` bytes before a
+    /// byte of it is read.
+    unsafe fn owned(s: W2rStr, max: u32) -> Result<String, W2rStatus> {
+        if s.len > max {
+            return Err(W2R_E_LIMIT);
+        }
+        unsafe { text(s) }.map(str::to_owned)
+    }
+
+    /// docs/abi.md, "Declared settings": only inside `on_load`; every string is copied here.
+    pub unsafe extern "C" fn settings_declare(
+        token: *mut c_void,
+        def: *const W2rSettingDef,
+    ) -> W2rStatus {
+        run(|| {
+            let slot = match enter(token) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            if !slot.loading.get() {
+                return W2R_E_STATE;
+            }
+            let Some(raw) = (unsafe { def.as_ref() }) else {
+                return W2R_E_INVALID;
+            };
+            if raw.struct_size < W2R_SETTING_DEF_V1_SIZE || raw.reserved != 0 {
+                return W2R_E_INVALID;
+            }
+            if slot.declared.borrow().len() >= crate::store::MAX_KEYS {
+                return W2R_E_LIMIT;
+            }
+            let declared = match unsafe { copy_declaration(raw) } {
+                Ok(d) => d,
+                Err(e) => return e,
+            };
+            let key_text = declared.key.clone();
+            let host_bools = crate::hostsettings::bool_keys();
+            let result = {
+                let earlier = slot.declared.borrow();
+                settings::validate(
+                    declared,
+                    &slot.id,
+                    "",
+                    &earlier,
+                    &host_bools,
+                    crate::store::valid_key,
+                )
+            };
+            match result {
+                Ok(d) => {
+                    slot.declared.borrow_mut().push(d);
+                    W2R_OK
+                }
+                Err(status) => {
+                    slot.log(
+                        W2R_LOG_WARN,
+                        &format!("settings_declare({key_text}) refused ({status})"),
+                    );
+                    status
+                }
+            }
+        })
+    }
+
+    /// The strings of a `W2rSettingDef`, copied. Lengths are checked before any byte is read,
+    /// so an absurd length is a status rather than a read past the plugin's buffer. Only the
+    /// fields the kind uses are read, so a plugin may leave the others uninitialised.
+    unsafe fn copy_declaration(raw: &W2rSettingDef) -> Result<DeclaredSetting, W2rStatus> {
+        if raw.kind == W2R_SETTING_CHOICE && raw.choice_count > W2R_MAX_SETTING_CHOICE_COUNT {
+            return Err(W2R_E_LIMIT);
+        }
+        let choices = if raw.kind == W2R_SETTING_CHOICE && raw.choice_count > 0 {
+            if raw.choices.is_null() {
+                return Err(W2R_E_INVALID);
+            }
+            let list =
+                unsafe { core::slice::from_raw_parts(raw.choices, raw.choice_count as usize) };
+            list.iter()
+                .map(|c| unsafe { owned(*c, W2R_MAX_SETTING_CHOICE) })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        unsafe {
+            Ok(DeclaredSetting {
+                kind: raw.kind,
+                flags: raw.flags,
+                key: owned(raw.key, W2R_MAX_SETTING_KEY)?,
+                label: owned(raw.label, W2R_MAX_SETTING_LABEL)?,
+                description: owned(raw.description, W2R_MAX_SETTING_DESCRIPTION)?,
+                category: owned(raw.category, W2R_MAX_SETTING_CATEGORY)?,
+                subcategory: owned(raw.subcategory, W2R_MAX_SETTING_CATEGORY)?,
+                default_int: raw.default_int,
+                min: raw.min,
+                max: raw.max,
+                default_str: if raw.kind == W2R_SETTING_STRING || raw.kind == W2R_SETTING_COLOR {
+                    owned(raw.default_str, W2R_MAX_SETTING_STR)?
+                } else {
+                    String::new()
+                },
+                choices,
+                active_when: owned(
+                    raw.active_when,
+                    W2R_MAX_SETTING_KEY + settings::HOST_PREFIX.len() as u32,
+                )?,
+            })
+        }
+    }
+
     /// docs/abi.md: printable ASCII, at most 200 bytes, 4 per 5 s, only while chat is available.
     pub unsafe extern "C" fn chat_send(token: *mut c_void, text: W2rStr) -> W2rStatus {
         run(|| {
@@ -848,7 +1001,7 @@ mod cb {
 
     /// Runs `f` on the plugin's settings, opening them on first use. The borrow ends before this
     /// returns and nothing in `f` can reach the plugin or the game.
-    fn with_settings<R>(
+    pub(super) fn with_settings<R>(
         slot: &Slot,
         f: impl FnOnce(&mut Settings) -> Result<R, W2rStatus>,
     ) -> Result<R, W2rStatus> {
@@ -867,7 +1020,7 @@ mod cb {
         f(guard.as_mut().expect("just opened"))
     }
 
-    fn set_status(e: SetError) -> W2rStatus {
+    pub(super) fn set_status(e: SetError) -> W2rStatus {
         match e {
             SetError::BadKey => W2R_E_INVALID,
             SetError::TooManyKeys | SetError::TooLarge => W2R_E_LIMIT,
@@ -905,7 +1058,11 @@ mod cb {
                 Err(e) => return e,
             };
             let got = with_settings(slot, |s| match s.get(k) {
-                None => Err(W2R_E_NOT_FOUND),
+                None => match declared_default(slot, k) {
+                    Some(Val::Int(i)) => Ok(i),
+                    Some(Val::Str(_)) => Err(W2R_E_INVALID),
+                    None => Err(W2R_E_NOT_FOUND),
+                },
                 Some(Val::Int(i)) => Ok(*i),
                 Some(Val::Str(_)) => Err(W2R_E_INVALID),
             });
@@ -962,7 +1119,11 @@ mod cb {
                 Err(e) => return e,
             };
             let got = with_settings(slot, |s| match s.get(k) {
-                None => Err(W2R_E_NOT_FOUND),
+                None => match declared_default(slot, k) {
+                    Some(Val::Str(v)) => Ok(v),
+                    Some(Val::Int(_)) => Err(W2R_E_INVALID),
+                    None => Err(W2R_E_NOT_FOUND),
+                },
                 Some(Val::Str(v)) => Ok(v.clone()),
                 Some(Val::Int(_)) => Err(W2R_E_INVALID),
             });
@@ -1461,6 +1622,160 @@ mod tests {
             ..Services::none()
         };
         (Registry::with(log, None, services), root)
+    }
+
+    fn setting_def(kind: u32, key: &'static str) -> W2rSettingDef {
+        W2rSettingDef {
+            struct_size: W2R_SETTING_DEF_V1_SIZE,
+            kind,
+            flags: 0,
+            key: s(key),
+            label: s("Label"),
+            description: s(""),
+            category: s("Chat"),
+            subcategory: s("Behavior"),
+            default_int: 0,
+            min: 0,
+            max: 0,
+            default_str: s(""),
+            choices: core::ptr::null(),
+            choice_count: 0,
+            reserved: 0,
+            active_when: s(""),
+        }
+    }
+
+    thread_local! {
+        static DECLARE_RESULTS: RefCell<Vec<W2rStatus>> = const { RefCell::new(Vec::new()) };
+    }
+
+    const CHOICES: [&str; 3] = ["Off", "Some", "All"];
+
+    unsafe extern "C" fn declaring_on_load(host: *const W2rHost) -> W2rStatus {
+        let h = unsafe { &*host };
+        let choices: Vec<W2rStr> = CHOICES.iter().map(|c| s(c)).collect();
+        let mut fade = setting_def(W2R_SETTING_INT, "fade");
+        fade.min = 0;
+        fade.max = 60;
+        fade.default_int = 7;
+        let mut channels = setting_def(W2R_SETTING_BOOL, "channels");
+        channels.default_int = 1;
+        let mut style = setting_def(W2R_SETTING_CHOICE, "style");
+        style.choices = choices.as_ptr();
+        style.choice_count = choices.len() as u32;
+        style.default_int = 2;
+        style.active_when = s("channels");
+        let mut tag = setting_def(W2R_SETTING_STRING, "tag");
+        tag.default_str = s("[All]");
+        let mut bad = setting_def(W2R_SETTING_INT, "bad");
+        bad.min = 3;
+        bad.max = 1;
+        let mut short = setting_def(W2R_SETTING_BOOL, "short");
+        short.struct_size = 4;
+        let mut reserved = setting_def(W2R_SETTING_BOOL, "reserved");
+        reserved.reserved = 1;
+        // A field the kind does not use is never read, whatever it holds.
+        let mut unused = setting_def(W2R_SETTING_BOOL, "unused");
+        unused.default_str = W2rStr {
+            ptr: core::ptr::dangling(),
+            len: u32::MAX,
+        };
+        let results = [
+            unsafe { (h.settings_declare)(h.token, &fade) },
+            unsafe { (h.settings_declare)(h.token, &channels) },
+            unsafe { (h.settings_declare)(h.token, &style) },
+            unsafe { (h.settings_declare)(h.token, &tag) },
+            unsafe { (h.settings_declare)(h.token, &fade) },
+            unsafe { (h.settings_declare)(h.token, &bad) },
+            unsafe { (h.settings_declare)(h.token, &short) },
+            unsafe { (h.settings_declare)(h.token, core::ptr::null()) },
+            unsafe { (h.settings_declare)(h.token, &reserved) },
+            unsafe { (h.settings_declare)(h.token, &unused) },
+        ];
+        DECLARE_RESULTS.with(|r| r.borrow_mut().extend(results));
+        W2R_OK
+    }
+    static DECLARING: W2rPlugin = W2rPlugin {
+        struct_size: W2R_PLUGIN_V1_SIZE,
+        on_load: Some(declaring_on_load),
+        on_event: None,
+        on_ui: None,
+        on_unload: None,
+    };
+    unsafe extern "C" fn declaring_entry(_: *const W2rHost) -> *const W2rPlugin {
+        &DECLARING
+    }
+
+    #[test]
+    fn settings_declare_works_only_in_on_load_and_validates() {
+        let (mut reg, root) = registry_with_root("declare");
+        DECLARE_RESULTS.with(|r| r.borrow_mut().clear());
+        let i = reg.load_entry("w2r-chat", declaring_entry).unwrap();
+        let got = DECLARE_RESULTS.with(|r| r.borrow().clone());
+        assert_eq!(
+            got,
+            vec![
+                W2R_OK,
+                W2R_OK,
+                W2R_OK,
+                W2R_OK,
+                W2R_E_CONFLICT,
+                W2R_E_INVALID,
+                W2R_E_INVALID,
+                W2R_E_INVALID,
+                W2R_E_INVALID,
+                W2R_OK
+            ]
+        );
+        let slot = reg.slot(i);
+        let declared = slot.declared();
+        assert_eq!(declared.len(), 5);
+        assert_eq!(declared[2].choices, vec!["Off", "Some", "All"]);
+        assert_eq!(
+            declared[2].active_when,
+            Some(settings::ActiveWhen {
+                owner: settings::Owner::Plugin("w2r-chat".into()),
+                key: "channels".into(),
+                test: settings::Condition::On,
+            })
+        );
+
+        // After on_load: refused.
+        let h = unsafe { &*slot.host() };
+        let late = setting_def(W2R_SETTING_BOOL, "late");
+        assert_eq!(unsafe { (h.settings_declare)(h.token, &late) }, W2R_E_STATE);
+
+        // A declared key that was never stored reads as its default.
+        let mut n = 0i64;
+        let mut buf = [0u8; 16];
+        let mut len = 0u32;
+        unsafe {
+            assert_eq!((h.settings_get_i64)(h.token, s("fade"), &mut n), W2R_OK);
+            assert_eq!(n, 7);
+            assert_eq!(
+                (h.settings_get_str)(h.token, s("tag"), buf.as_mut_ptr().cast(), 16, &mut len),
+                W2R_OK
+            );
+            assert_eq!(&buf[..len as usize], b"[All]");
+            assert_eq!(
+                (h.settings_get_i64)(h.token, s("tag"), &mut n),
+                W2R_E_INVALID
+            );
+            assert_eq!(
+                (h.settings_get_i64)(h.token, s("missing"), &mut n),
+                W2R_E_NOT_FOUND
+            );
+        }
+
+        // The options screen stores through the slot; the plugin then reads the stored value.
+        assert_eq!(slot.stored_setting("fade"), None);
+        slot.store_setting("fade", Val::Int(12)).unwrap();
+        assert_eq!(slot.stored_setting("fade"), Some(Val::Int(12)));
+        unsafe {
+            assert_eq!((h.settings_get_i64)(h.token, s("fade"), &mut n), W2R_OK);
+        }
+        assert_eq!(n, 12);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

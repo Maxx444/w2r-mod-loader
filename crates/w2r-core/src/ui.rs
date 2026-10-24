@@ -1,4 +1,4 @@
-//! The widget API (`W2rUi`, docs/abi.md) and the in-game plugin screen. Widgets are behind
+//! The widget API (`W2rUi`, docs/abi.md) and the plugin manager's list. Widgets are behind
 //! [`Widgets`] so the plugin-facing rules are testable with a fake; `options.rs` binds them to
 //! the game's own menu widgets.
 //!
@@ -14,7 +14,6 @@ use w2r_abi::{W2rStr, W2rUi};
 pub const MAX_TEXT: usize = 128;
 /// Row height in the game's UI space (2160 high), the options screen's value.
 pub const ROW_H: f32 = 90.0;
-pub const HEADING_H: f32 = 160.0;
 /// The gap the plugin screen puts between rows (set on the game's layout context).
 pub const ROW_GAP: f32 = 24.0;
 /// What a plugin's card needs beyond its rows: the frame's own padding, top and bottom.
@@ -24,6 +23,10 @@ pub const CARD_TOP_H: f32 = 70.0;
 /// An edit row. The game's edit box pads its text, and the plugin screen's font is 80 high, so a
 /// 90-high row clips the text away and leaves only the caret (seen in game).
 pub const EDIT_ROW_H: f32 = 150.0;
+/// Room added to a measured text width, so neighbouring cells do not touch.
+pub const CELL_PAD: f32 = 24.0;
+/// The author's name on a plugin card: the game's gold, packed as Nuklear packs colors.
+pub const AUTHOR_COLOUR: u32 = 0xff00_ccff;
 
 /// One row of widgets. `label` and friends each take the whole row.
 pub trait Widgets {
@@ -48,6 +51,38 @@ pub trait Widgets {
         true
     }
     fn card_end(&self) {}
+    /// How wide `text` is drawn, in UI units.
+    fn text_width(&self, text: &str) -> f32 {
+        text.len() as f32 * 40.0
+    }
+    /// How many lines `text` wraps to at `width`.
+    fn text_lines(&self, _text: &str, _width: f32) -> i32 {
+        1
+    }
+    /// The height of one line of text.
+    fn line_height(&self) -> f32 {
+        ROW_H
+    }
+    /// The width a row's cells share.
+    fn row_width(&self) -> f32 {
+        1000.0
+    }
+    /// A row of cells of the given widths, left to right. A width of 0 shares what the others
+    /// leave.
+    fn row_cells(&self, height: f32, widths: &[f32]) {
+        self.row(height, widths.len() as i32);
+    }
+    fn label_coloured(&self, text: &str, _colour: u32) {
+        self.label(text);
+    }
+    /// A label against the right edge of its cell.
+    fn label_right(&self, text: &str) {
+        self.label(text);
+    }
+    /// A label that wraps onto as many lines as its row is tall.
+    fn label_wrapped(&self, text: &str) {
+        self.label(text);
+    }
 }
 
 /// Forwards to `inner` and adds up the height of the rows drawn through it, so a card can be
@@ -82,6 +117,31 @@ impl Widgets for Measured<'_> {
     }
     fn disable_end(&self) {
         self.inner.disable_end();
+    }
+    fn text_width(&self, text: &str) -> f32 {
+        self.inner.text_width(text)
+    }
+    fn text_lines(&self, text: &str, width: f32) -> i32 {
+        self.inner.text_lines(text, width)
+    }
+    fn line_height(&self) -> f32 {
+        self.inner.line_height()
+    }
+    fn row_width(&self) -> f32 {
+        self.inner.row_width()
+    }
+    fn row_cells(&self, height: f32, widths: &[f32]) {
+        self.height.set(self.height.get() + height + ROW_GAP);
+        self.inner.row_cells(height, widths);
+    }
+    fn label_coloured(&self, text: &str, colour: u32) {
+        self.inner.label_coloured(text, colour);
+    }
+    fn label_right(&self, text: &str) {
+        self.inner.label_right(text);
+    }
+    fn label_wrapped(&self, text: &str) {
+        self.inner.label_wrapped(text);
     }
 }
 
@@ -276,241 +336,84 @@ mod cb {
     }
 }
 
-/// A plugin as the screen shows it.
+/// A plugin as the manager shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginRow {
     pub id: String,
+    /// The name from `plugin.json`, or the id when it cannot be read.
+    pub name: String,
     pub version: String,
-    /// The author from `plugin.json`, when it can be read (shown even for plugins not loaded).
     pub author: Option<String>,
-    /// `enabled` in state.json (takes effect at the next launch).
+    pub description: Option<String>,
+    /// `enabled` in state.json, which takes effect at the next launch.
     pub enabled: bool,
-    /// What the host did with it this session.
-    pub status: Status,
+    /// `enabled` as it was at launch.
+    pub enabled_at_launch: bool,
+    /// Whether the plugin is running this session.
+    pub running: bool,
+    /// Its callbacks have been slow (`Slot::is_slow`).
     pub slow: bool,
+    /// Why it is not running, when that is a failure: a fault, or a refusal at load.
+    pub error: Option<String>,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Status {
-    Active,
-    Disabled(String),
-    /// Enabled in state.json but refused before it got a slot, or not enabled.
-    NotLoaded,
-}
-
-/// The host's own section at the top of the screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostRow {
-    /// The simulation fingerprint of this session (docs/load-policy.md).
-    pub fingerprint: [u8; 4],
-    /// The plugins in it, by id.
-    pub simulation: Vec<String>,
-    /// `lock_team_changes` and `lock_slot_swaps` (`host.json`); take effect at once when hosting.
-    pub lock_teams: bool,
-    pub lock_slots: bool,
-    /// `enhanced_create_screen` (`host.json`); takes effect the next time the screen opens.
-    pub create_screen: bool,
-    /// `enhanced_lobby_screen` (`host.json`); takes effect the next time a lobby opens.
-    pub lobby_screen: bool,
-    /// `map_sharing` and `auto_download` (`host.json`); sharing takes effect at once.
-    pub map_sharing: bool,
-    pub auto_download: bool,
-    /// `record_replays` (`host.json`); takes effect from the next match.
-    pub record_replays: bool,
-    /// `auto_game_name` (`host.json`); the create screen suggests a game name on its own.
-    pub auto_game_name: bool,
-    /// The APM counter (`host.json`, docs/apm.md); every part applies at once.
-    pub apm_display: bool,
-    pub apm_alert_below: u32,
-    pub apm_color_text: bool,
-    pub apm_play_sound: bool,
-    /// `minimap_ping` (`host.json`).
-    pub minimap_ping: bool,
-    /// `net_panel` (`host.json`): the connection table is up at the start of a match.
-    pub net_panel: bool,
-    /// `share_match_data` (`sharing.json`); match reports are uploaded from the next match.
-    pub share_match_data: bool,
-}
-
-/// The APM threshold's edit text: whether it was filled from the setting yet, and the bytes.
-static APM_BUFFER: std::sync::Mutex<(bool, [u8; 5])> = std::sync::Mutex::new((false, [0; 5]));
-
-pub const LOCK_TEAMS_LABEL: &str = "Lock team changes";
-pub const LOCK_SLOTS_LABEL: &str = "Lock slot swaps";
-pub const CREATE_SCREEN_LABEL: &str = "Custom create game screen";
-pub const LOBBY_SCREEN_LABEL: &str = "Custom lobby screen";
-pub const MAP_SHARING_LABEL: &str = "Share maps with players";
-pub const AUTO_DOWNLOAD_LABEL: &str = "Download missing maps automatically";
-pub const RECORD_REPLAYS_LABEL: &str = "Save replays";
-pub const AUTO_GAME_NAME_LABEL: &str = "Auto-Name Games by Map";
-pub const APM_DISPLAY_LABEL: &str = "Display APM In Game";
-pub const APM_ALERT_LABEL: &str = "Alert when APM falls below";
-pub const APM_COLOR_LABEL: &str = "Color APM Text Red When Low";
-pub const APM_SOUND_LABEL: &str = "Play Sound When APM Is Low";
-pub const MINIMAP_PING_LABEL: &str = "Minimap Pings (Alt+G, click)";
-pub const NET_PANEL_LABEL: &str = "Show Connection Table In Game (Ctrl+Shift+N)";
-pub const SHARE_LABEL: &str = "Contribute Match Data";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
-    Back,
     /// The user flipped a plugin's enabled flag.
     Toggle(usize),
-    /// The user flipped `require_matching_plugins`.
-    /// The user flipped one of the lobby locks.
-    ToggleLocks,
-    /// The user flipped `enhanced_create_screen`.
-    ToggleCreateScreen,
-    /// The user flipped `enhanced_lobby_screen`.
-    ToggleLobbyScreen,
-    /// The user flipped `map_sharing` or `auto_download`.
-    ToggleMapSharing,
-    /// The user flipped `record_replays`.
-    ToggleRecording,
-    /// The user flipped `auto_game_name`.
-    ToggleAutoGameName,
-    /// The user changed one of the APM settings.
-    ChangeApm,
-    /// The user flipped `minimap_ping`.
-    ToggleMinimapPing,
-    /// The user flipped `net_panel`.
-    ToggleNetPanel,
-    /// The user flipped `share_match_data`.
-    ToggleSharing,
 }
 
-/// Draws the host section and the plugin list. `draw_section` draws the plugin's own widgets
-/// for an active row.
-pub fn draw_plugin_screen(
+/// A card's status line. A restart is needed when the enable box changed since launch.
+pub fn status_text(row: &PluginRow) -> String {
+    let state = if row.running { "Running" } else { "Disabled" };
+    let mut notes = Vec::new();
+    if row.running && row.slow {
+        notes.push("slow callbacks");
+    }
+    if row.error.is_some() {
+        notes.push("error");
+    }
+    if row.enabled != row.enabled_at_launch {
+        notes.push("restart to update");
+    }
+    if notes.is_empty() {
+        format!("Status: {state}")
+    } else {
+        format!("Status: {state} ({})", notes.join(", "))
+    }
+}
+
+/// `text` wrapped onto as many lines as it needs, in a row of its own.
+fn paragraph(w: &dyn Widgets, text: &str) {
+    let lines = w.text_lines(text, w.row_width()).max(1);
+    let height = (lines as f32 * w.line_height()).max(ROW_H);
+    w.row_cells(height, &[0.0]);
+    w.label_wrapped(text);
+}
+
+/// The plugin manager's list (docs/settings-screen.md): the session's simulation fingerprint,
+/// then a card per plugin with its name, author and version, its status and enable box, its
+/// description, and under them any rows the plugin still draws itself through `on_ui`.
+/// `draw_section` draws a running plugin's own rows.
+pub fn draw_plugin_list(
     w: &dyn Widgets,
-    host: &mut HostRow,
+    fingerprint: [u8; 4],
+    simulation: &[String],
     rows: &mut [PluginRow],
     mut draw_section: impl FnMut(&dyn Widgets, usize),
 ) -> Action {
     let mut action = Action::None;
-    w.row(HEADING_H, 1);
-    w.label("Host");
     w.row(ROW_H, 1);
     w.label(&format!(
         "Fingerprint: {} ({})",
-        crate::fingerprint::hex(&host.fingerprint),
-        if host.simulation.is_empty() {
+        crate::fingerprint::hex(&fingerprint),
+        if simulation.is_empty() {
             "no plugins".to_owned()
         } else {
-            host.simulation.join(", ")
+            simulation.join(", ")
         }
     ));
-    w.row(ROW_H, 1);
-    let mut lock_teams = host.lock_teams;
-    if w.checkbox(LOCK_TEAMS_LABEL, &mut lock_teams) {
-        host.lock_teams = lock_teams;
-        action = Action::ToggleLocks;
-    }
-    w.row(ROW_H, 1);
-    let mut lock_slots = host.lock_slots;
-    if w.checkbox(LOCK_SLOTS_LABEL, &mut lock_slots) {
-        host.lock_slots = lock_slots;
-        action = Action::ToggleLocks;
-    }
-    w.row(ROW_H, 1);
-    let mut create_screen = host.create_screen;
-    if w.checkbox(CREATE_SCREEN_LABEL, &mut create_screen) {
-        host.create_screen = create_screen;
-        action = Action::ToggleCreateScreen;
-    }
-    w.row(ROW_H, 1);
-    let mut lobby_screen = host.lobby_screen;
-    if w.checkbox(LOBBY_SCREEN_LABEL, &mut lobby_screen) {
-        host.lobby_screen = lobby_screen;
-        action = Action::ToggleLobbyScreen;
-    }
-    w.row(ROW_H, 1);
-    let mut map_sharing = host.map_sharing;
-    if w.checkbox(MAP_SHARING_LABEL, &mut map_sharing) {
-        host.map_sharing = map_sharing;
-        action = Action::ToggleMapSharing;
-    }
-    w.row(ROW_H, 1);
-    let mut auto_download = host.auto_download;
-    if w.checkbox(AUTO_DOWNLOAD_LABEL, &mut auto_download) {
-        host.auto_download = auto_download;
-        action = Action::ToggleMapSharing;
-    }
-    w.row(ROW_H, 1);
-    let mut record_replays = host.record_replays;
-    if w.checkbox(RECORD_REPLAYS_LABEL, &mut record_replays) {
-        host.record_replays = record_replays;
-        action = Action::ToggleRecording;
-    }
-    w.row(ROW_H, 1);
-    let mut auto_game_name = host.auto_game_name;
-    if w.checkbox(AUTO_GAME_NAME_LABEL, &mut auto_game_name) {
-        host.auto_game_name = auto_game_name;
-        action = Action::ToggleAutoGameName;
-    }
-    w.row(ROW_H, 1);
-    let mut ping = host.minimap_ping;
-    if w.checkbox(MINIMAP_PING_LABEL, &mut ping) {
-        host.minimap_ping = ping;
-        action = Action::ToggleMinimapPing;
-    }
-    w.row(ROW_H, 1);
-    let mut share = host.share_match_data;
-    if w.checkbox(SHARE_LABEL, &mut share) {
-        host.share_match_data = share;
-        action = Action::ToggleSharing;
-    }
-    w.row(HEADING_H, 1);
-    w.label("APM Counter");
-    w.row(ROW_H, 1);
-    let mut apm_display = host.apm_display;
-    if w.checkbox(APM_DISPLAY_LABEL, &mut apm_display) {
-        host.apm_display = apm_display;
-        action = Action::ChangeApm;
-    }
-    // The threshold is typed into a box that keeps its text between frames (the game holds the
-    // buffer's address while it is focused, so it lives in a static).
-    w.row(EDIT_ROW_H, 2);
-    if let Ok(mut buf) = APM_BUFFER.lock() {
-        if !buf.0 {
-            let text = host.apm_alert_below.to_string();
-            buf.1[..text.len()].copy_from_slice(text.as_bytes());
-            buf.0 = true;
-        }
-        if w.text_edit(APM_ALERT_LABEL, &mut buf.1) {
-            // Digits only, and never more than the setting allows.
-            let digits: String = buf.1.iter().take_while(|&&c| c != 0).map(|&c| c as char)
-                .filter(char::is_ascii_digit).collect();
-            let value = digits.parse::<u32>().unwrap_or(0).min(crate::hostcfg::APM_ALERT_MAX);
-            if value != host.apm_alert_below {
-                host.apm_alert_below = value;
-                action = Action::ChangeApm;
-            }
-        }
-    }
-    w.row(ROW_H, 1);
-    let mut apm_color = host.apm_color_text;
-    if w.checkbox(APM_COLOR_LABEL, &mut apm_color) {
-        host.apm_color_text = apm_color;
-        action = Action::ChangeApm;
-    }
-    w.row(ROW_H, 1);
-    let mut apm_sound = host.apm_play_sound;
-    if w.checkbox(APM_SOUND_LABEL, &mut apm_sound) {
-        host.apm_play_sound = apm_sound;
-        action = Action::ChangeApm;
-    }
-    w.row(HEADING_H, 1);
-    w.label("Connection");
-    w.row(ROW_H, 1);
-    let mut net_panel = host.net_panel;
-    if w.checkbox(NET_PANEL_LABEL, &mut net_panel) {
-        host.net_panel = net_panel;
-        action = Action::ToggleNetPanel;
-    }
-    w.row(HEADING_H, 1);
-    w.label(&format!("Plugins ({})", rows.len()));
     if rows.is_empty() {
         w.row(ROW_H, 1);
         w.label("No plugins installed. Use the W2R Mod Loader to add some.");
@@ -526,36 +429,42 @@ pub fn draw_plugin_screen(
             inner: w,
             height: Cell::new(CARD_TOP_H + ROW_GAP),
         };
-        m.row(ROW_H, 2);
-        m.label(&format!("{} {}", row.id, row.version));
+
+        // The name, with the version against the right edge, then the author in gold.
+        let version_w = m.text_width(&row.version) + CELL_PAD;
+        m.row_cells(ROW_H, &[0.0, version_w]);
+        m.label(&row.name);
+        m.label_right(&row.version);
+        if let Some(author) = &row.author {
+            let caption_w = m.text_width("Author:") + CELL_PAD;
+            m.row_cells(ROW_H, &[caption_w, 0.0]);
+            m.label("Author:");
+            m.label_coloured(author, AUTHOR_COLOUR);
+        }
+
+        // The status, with the enable box against the right edge.
+        let enable_w = m.text_width(" Enable") + ROW_H + CELL_PAD;
+        m.row_cells(ROW_H, &[0.0, enable_w]);
+        m.label(&status_text(row));
         let mut enabled = row.enabled;
-        if m.checkbox("Enabled (next launch)", &mut enabled) {
+        if m.checkbox("Enable", &mut enabled) {
             row.enabled = enabled;
             action = Action::Toggle(i);
         }
-        m.row(ROW_H, 1);
-        m.label(&format!(
-            "Author: {}",
-            row.author.as_deref().unwrap_or("unknown")
-        ));
-        m.row(ROW_H, 1);
-        let status = match &row.status {
-            Status::Active if row.slow => "Status: running (slow callbacks)".to_owned(),
-            Status::Active => "Status: running".to_owned(),
-            Status::Disabled(reason) => format!("Status: disabled, {reason}"),
-            Status::NotLoaded => "Status: not loaded this session (w2r.log says why)".to_owned(),
-        };
-        m.label(&status);
-        if row.status == Status::Active {
+
+        if let Some(error) = &row.error {
+            paragraph(&m, &format!("Error: {error}"));
+        }
+        if let Some(description) = row.description.as_deref().filter(|d| !d.is_empty()) {
+            paragraph(&m, &format!("Description: {description}"));
+        }
+
+        if row.running {
             draw_section(&m, i);
         }
         w.card_end();
         let needed = m.height.get() + CARD_PAD;
         CARD_HEIGHTS.with(|h| h.borrow_mut().insert(row.id.clone(), needed));
-    }
-    w.row(HEADING_H, 1);
-    if w.button("Back") {
-        action = Action::Back;
     }
     action
 }
@@ -728,194 +637,105 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_screen_lists_toggles_and_goes_back() {
+    fn status_lines_say_when_a_restart_is_needed() {
+        let row = |running, enabled, launched| PluginRow {
+            id: "p".into(),
+            name: "p".into(),
+            version: "1.0.0".into(),
+            author: None,
+            description: None,
+            enabled,
+            enabled_at_launch: launched,
+            running,
+            slow: false,
+            error: None,
+        };
+        assert_eq!(status_text(&row(true, true, true)), "Status: Running");
+        assert_eq!(
+            status_text(&row(true, false, true)),
+            "Status: Running (restart to update)"
+        );
+        assert_eq!(status_text(&row(false, false, false)), "Status: Disabled");
+        assert_eq!(
+            status_text(&row(false, true, false)),
+            "Status: Disabled (restart to update)"
+        );
+        // A plugin that faulted is not waiting for a restart.
+        let mut faulted = row(false, true, true);
+        faulted.error = Some("on_ui: access violation".into());
+        assert_eq!(status_text(&faulted), "Status: Disabled (error)");
+        let mut slow = row(true, true, true);
+        slow.slow = true;
+        assert_eq!(status_text(&slow), "Status: Running (slow callbacks)");
+    }
+
+    #[test]
+    fn the_plugin_list_draws_cards_and_toggles() {
         let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push("Enabled (next launch)".into());
+        fake.flip.borrow_mut().push("Enable".into());
         let mut rows = vec![
             PluginRow {
                 id: "a".into(),
+                name: "Alpha".into(),
                 version: "1.0.0".into(),
                 author: Some("Ann".into()),
+                description: Some("Does a.".into()),
                 enabled: true,
-                status: Status::Active,
+                enabled_at_launch: true,
+                running: true,
                 slow: false,
+                error: None,
             },
             PluginRow {
                 id: "b".into(),
+                name: "b".into(),
                 version: "2.0.0".into(),
                 author: None,
+                description: None,
                 enabled: false,
-                status: Status::NotLoaded,
+                enabled_at_launch: true,
+                running: false,
                 slow: false,
-            },
-            PluginRow {
-                id: "c".into(),
-                version: "0.1.0".into(),
-                author: Some("Cy".into()),
-                enabled: true,
-                status: Status::Disabled("boom".into()),
-                slow: true,
+                error: Some("E_LOAD: on_load returned -4".into()),
             },
         ];
-        let mut host = HostRow {
-            fingerprint: [0xaa, 0xbb, 0xcc, 0xdd],
-            simulation: vec!["a".into(), "c".into()],
-            lock_teams: false,
-            lock_slots: false,
-            create_screen: false,
-            lobby_screen: false,
-            map_sharing: false,
-            auto_download: false,
-            record_replays: false,
-            auto_game_name: false,
-            apm_display: false,
-            apm_alert_below: 60,
-            apm_color_text: true,
-            apm_play_sound: false,
-            minimap_ping: true,
-            net_panel: false,
-            share_match_data: false,
-        };
+        let simulation = vec!["a".to_owned()];
         let mut sections = Vec::new();
-        let action = draw_plugin_screen(&fake, &mut host, &mut rows, |_, i| sections.push(i));
-        // Every row's checkbox flipped; the last flip wins as the reported action.
-        assert_eq!(action, Action::Toggle(2));
-        assert!(!rows[0].enabled && rows[1].enabled && !rows[2].enabled);
-        assert_eq!(sections, vec![0], "only active plugins draw their section");
+        let action = draw_plugin_list(
+            &fake,
+            [0xaa, 0xbb, 0xcc, 0xdd],
+            &simulation,
+            &mut rows,
+            |_, i| sections.push(i),
+        );
+        // Every card's box flipped; the last flip wins as the reported action.
+        assert_eq!(action, Action::Toggle(1));
+        assert!(!rows[0].enabled && rows[1].enabled);
+        assert_eq!(sections, vec![0], "only running plugins draw their section");
         let calls = fake.calls.borrow();
-        assert_eq!(calls[1], "label \"Host\"");
-        assert_eq!(
-            calls[3],
-            "label \"Fingerprint: aabbccdd (a, c)\""
-        );
-        assert_eq!(calls[5], format!("checkbox {LOCK_TEAMS_LABEL:?} false"));
-        assert_eq!(calls[7], format!("checkbox {LOCK_SLOTS_LABEL:?} false"));
-        assert_eq!(calls[9], format!("checkbox {CREATE_SCREEN_LABEL:?} false"));
-        assert_eq!(calls[11], format!("checkbox {LOBBY_SCREEN_LABEL:?} false"));
-        assert_eq!(calls[13], format!("checkbox {MAP_SHARING_LABEL:?} false"));
-        assert_eq!(calls[15], format!("checkbox {AUTO_DOWNLOAD_LABEL:?} false"));
-        assert_eq!(calls[17], format!("checkbox {RECORD_REPLAYS_LABEL:?} false"));
-        assert_eq!(calls[19], format!("checkbox {AUTO_GAME_NAME_LABEL:?} false"));
-        assert_eq!(calls[21], format!("checkbox {MINIMAP_PING_LABEL:?} true"));
-        assert_eq!(calls[23], format!("checkbox {SHARE_LABEL:?} false"));
-        assert_eq!(calls[25], "label \"APM Counter\"");
-        assert_eq!(calls[27], format!("checkbox {APM_DISPLAY_LABEL:?} false"));
-        assert_eq!(calls[29], format!("text_edit {APM_ALERT_LABEL:?}"));
-        assert_eq!(calls[31], format!("checkbox {APM_COLOR_LABEL:?} true"));
-        assert_eq!(calls[33], format!("checkbox {APM_SOUND_LABEL:?} false"));
-        assert_eq!(calls[35], "label \"Connection\"");
-        assert_eq!(calls[37], format!("checkbox {NET_PANEL_LABEL:?} false"));
-        assert_eq!(calls[39], "label \"Plugins (3)\"");
-        assert!(calls.iter().any(|c| c == "label \"Author: Ann\""));
-        assert!(calls.iter().any(|c| c == "label \"Author: unknown\""));
-        assert!(calls.iter().any(|c| c == "label \"Status: running\""));
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("label \"Status: not loaded"))
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "label \"Status: disabled, boom\"")
-        );
+        assert_eq!(calls[1], "label \"Fingerprint: aabbccdd (a)\"");
+        for line in [
+            "label \"Alpha\"",
+            "label \"Author:\"",
+            "label \"Ann\"",
+            "label \"1.0.0\"",
+            "label \"Status: Running\"",
+            "label \"Description: Does a.\"",
+            "label \"Status: Disabled (error, restart to update)\"",
+            "label \"Error: E_LOAD: on_load returned -4\"",
+        ] {
+            assert!(calls.iter().any(|c| c == line), "{line} missing: {calls:?}");
+        }
         drop(calls);
 
         let fake = FakeWidgets::default();
-        fake.press.borrow_mut().push("Back".into());
-        let mut host = HostRow {
-            fingerprint: [0; 4],
-            simulation: Vec::new(),
-            lock_teams: false,
-            lock_slots: false,
-            create_screen: false,
-            lobby_screen: false,
-            map_sharing: false,
-            auto_download: false,
-            record_replays: false,
-            auto_game_name: false,
-            apm_display: false,
-            apm_alert_below: 60,
-            apm_color_text: true,
-            apm_play_sound: false,
-            minimap_ping: true,
-            net_panel: false,
-            share_match_data: false,
-        };
         assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::Back
+            draw_plugin_list(&fake, [0; 4], &[], &mut [], |_, _| {}),
+            Action::None
         );
         let calls = fake.calls.borrow();
         assert!(calls.iter().any(|c| c.contains("No plugins installed")));
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.contains("00000000 (no plugins)"))
-        );
-        drop(calls);
-
-        // The two locks are their own action.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(LOCK_SLOTS_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleLocks
-        );
-        assert!(host.lock_slots && !host.lock_teams);
-
-        // And the create screen switch.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(CREATE_SCREEN_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleCreateScreen
-        );
-        assert!(host.create_screen);
-
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(LOBBY_SCREEN_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleLobbyScreen
-        );
-        assert!(host.lobby_screen);
-
-        // And the map sharing pair.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(AUTO_DOWNLOAD_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleMapSharing
-        );
-        assert!(host.auto_download && !host.map_sharing);
-
-        // And the recording switch.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(RECORD_REPLAYS_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleRecording
-        );
-        assert!(host.record_replays);
-
-        // And the game name switch.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(AUTO_GAME_NAME_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleAutoGameName
-        );
-        assert!(host.auto_game_name);
-
-        // And the sharing switch.
-        let fake = FakeWidgets::default();
-        fake.flip.borrow_mut().push(SHARE_LABEL.into());
-        assert_eq!(
-            draw_plugin_screen(&fake, &mut host, &mut [], |_, _| {}),
-            Action::ToggleSharing
-        );
-        assert!(host.share_match_data);
+        assert!(calls.iter().any(|c| c.contains("00000000 (no plugins)")));
     }
 
     #[test]

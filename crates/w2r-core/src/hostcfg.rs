@@ -42,6 +42,9 @@ pub struct HostConfig {
     pub minimap_ping: bool,
     /// Start each match with the connection table up (docs/net-panel.md); Ctrl+Shift+N toggles it.
     pub net_panel: bool,
+    /// Fix Overscroll (docs/settings-screen.md): hides the arrow buttons of every vertical
+    /// scrollbar in the game, which removes the empty strip under scrolling lists.
+    pub hide_scrollbar_arrows: bool,
 }
 
 /// The highest threshold the settings screen accepts.
@@ -68,6 +71,7 @@ impl Default for HostConfig {
             apm_play_sound: false,
             minimap_ping: true,
             net_panel: false,
+            hide_scrollbar_arrows: true,
         }
     }
 }
@@ -110,6 +114,9 @@ pub fn parse(raw: &[u8]) -> Result<HostConfig, &'static str> {
             "apm_play_sound" => cfg.apm_play_sound = value.as_bool().ok_or("bad_field")?,
             "minimap_ping" => cfg.minimap_ping = value.as_bool().ok_or("bad_field")?,
             "net_panel" => cfg.net_panel = value.as_bool().ok_or("bad_field")?,
+            "hide_scrollbar_arrows" => {
+                cfg.hide_scrollbar_arrows = value.as_bool().ok_or("bad_field")?;
+            }
             "apm_alert_below" => {
                 let n = value.as_number().and_then(Number::as_u64).ok_or("bad_field")?;
                 if n > u64::from(APM_ALERT_MAX) {
@@ -186,6 +193,10 @@ impl HostConfig {
             ),
             ("minimap_ping".to_owned(), Value::Bool(self.minimap_ping)),
             ("net_panel".to_owned(), Value::Bool(self.net_panel)),
+            (
+                "hide_scrollbar_arrows".to_owned(),
+                Value::Bool(self.hide_scrollbar_arrows),
+            ),
         ])
         .to_json()
     }
@@ -252,6 +263,7 @@ mod tests {
             apm_play_sound: true,
             minimap_ping: false,
             net_panel: true,
+            hide_scrollbar_arrows: false,
         };
         assert_eq!(parse(cfg.to_json().as_bytes()), Ok(cfg));
         assert_eq!(
@@ -344,6 +356,7 @@ mod tests {
             apm_play_sound: false,
             minimap_ping: true,
             net_panel: false,
+            hide_scrollbar_arrows: true,
         };
         write(&root, &cfg).unwrap();
         assert_eq!(read(&root), (cfg, None));

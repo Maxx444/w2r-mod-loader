@@ -156,10 +156,18 @@ impl Loaded {
     }
 }
 
-/// The author of each listed plugin, from its `plugin.json`, for the plugin screen. Display only:
-/// a plugin whose manifest is missing or invalid has no entry (the load checks report why), and
+/// What a listed plugin's `plugin.json` says about it, for display.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginInfo {
+    pub name: String,
+    pub author: String,
+    pub description: String,
+}
+
+/// Each listed plugin's name, author and description, from its `plugin.json`. Display only: a
+/// plugin whose manifest is missing or invalid has no entry (the load checks report why), and
 /// nothing here decides whether a plugin runs.
-pub fn authors(root: &Path, state: &State) -> BTreeMap<String, String> {
+pub fn infos(root: &Path, state: &State) -> BTreeMap<String, PluginInfo> {
     state
         .plugins
         .iter()
@@ -170,7 +178,14 @@ pub fn authors(root: &Path, state: &State) -> BTreeMap<String, String> {
             )
             .ok()?;
             let m = manifest::validate(&raw).ok()?;
-            Some((st.id.clone(), m.author))
+            Some((
+                st.id.clone(),
+                PluginInfo {
+                    name: m.name,
+                    author: m.author,
+                    description: m.description,
+                },
+            ))
         })
         .collect()
 }

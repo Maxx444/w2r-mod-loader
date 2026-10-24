@@ -5,8 +5,8 @@
 //! elsewhere wait in a queue for the next frame.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,6 +25,7 @@ use crate::guard::Fault;
 use crate::handshake::{self, Handshake, Out};
 use crate::host::{Game, Log, Services, State as SlotState};
 use crate::hostcfg::{self, HostConfig};
+use crate::hostsettings;
 use crate::lobby::{self, Event, Lobby};
 use crate::lobbylayout::{self, ModMark};
 use crate::lobbypolicy::{self, Locks};
@@ -33,10 +34,12 @@ use crate::manifest::Build;
 use crate::options;
 use crate::peer::{self, NoTransport, PluginMessage, Presence, Roster, Transport};
 use crate::plugins;
+use crate::settings::{self, Editor, Owner, SettingDef};
 use crate::state::{self, State};
+use crate::store::Val;
 use crate::symbols::Symbols;
 use crate::target::GAME_VERSION;
-use crate::ui::{self, Action, HostRow, PluginRow, Status, Widgets};
+use crate::ui::{self, Action, PluginRow, Widgets};
 
 struct Session {
     registry: Registry,
@@ -48,11 +51,18 @@ struct Session {
     fingerprint: [u8; 4],
     /// The plugins in the fingerprint.
     simulation: Vec<String>,
-    /// Plugin id to author, read once from the manifests for the plugin screen.
-    authors: BTreeMap<String, String>,
-    /// How many plugins `state.json` had enabled at startup, for the title screen's summary.
-    enabled_at_start: usize,
+    /// Each plugin's name, author and description, read once from the manifests.
+    plugin_info: BTreeMap<String, plugins::PluginInfo>,
+    /// The plugins `state.json` had enabled at startup.
+    enabled_at_start: BTreeSet<String>,
     net: Rc<Net>,
+    /// The options screen's settings: the game's, the host's and every plugin's
+    /// (docs/settings-screen.md). Only the x86 screen draws it.
+    #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+    editor: Editor,
+    /// The game's own settings table, when it passed validation.
+    #[cfg(target_arch = "x86")]
+    native: Option<crate::nativesettings::game::Bridge>,
     #[cfg(target_arch = "x86")]
     nk: Option<options::Nk>,
 }
@@ -66,7 +76,7 @@ pub fn plugin_summary() -> Option<String> {
             .filter(|&i| matches!(s.registry.slot(i).state(), SlotState::Disabled { .. }))
             .count();
         let active = s.registry.len() - disabled;
-        let failed = disabled + s.enabled_at_start.saturating_sub(s.registry.len());
+        let failed = disabled + s.enabled_at_start.len().saturating_sub(s.registry.len());
         let noun = |n: usize| if n == 1 { "plugin" } else { "plugins" };
         Some(if failed == 0 {
             format!("{active} {} loaded", noun(active))
@@ -568,238 +578,279 @@ pub fn plugins_chat_line() -> Option<String> {
     })
 }
 
-/// Draws the plugin list with `w` and applies the user's toggles. Called from the options
-/// screen hook on the main thread.
-pub fn draw_plugin_screen(w: &dyn Widgets) -> Action {
+/// The options screen's settings, built once the plugins have loaded: the game's own (when its
+/// table validated), the host's, then each active plugin's declarations. A plugin that named no
+/// category gets one named after it, and every plugin setting carries the plugin's name for its
+/// tooltip.
+fn settings_registry(
+    native: Option<&[crate::nativesettings::Entry]>,
+    plugins: &Registry,
+    names: &BTreeMap<String, plugins::PluginInfo>,
+) -> settings::Registry {
+    let mut r = settings::Registry::new();
+    if let Some(entries) = native {
+        crate::nativesettings::register(&mut r, entries);
+    }
+    for d in hostsettings::defs() {
+        let v = settings::Value::Int(d.default_int);
+        r.register(d, v);
+    }
+    for slot in plugins.slots().filter(|s| s.is_active()) {
+        let name = names
+            .get(&slot.id)
+            .map_or_else(|| slot.id.clone(), |i| i.name.clone());
+        for mut d in slot.declared() {
+            if d.category.is_empty() {
+                d.category = name.clone();
+            }
+            d.source = Some(name.clone());
+            let v = d.default_value();
+            r.register(d, v);
+        }
+    }
+    r
+}
+
+/// Re-applies `host.json` to the parts of the host that read it, after the options screen
+/// changed it. Each of these is cheap and idempotent, so all of them run.
+// Called only by the x86 options screen; kept on every target so the tests below run on all.
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+fn apply_host_config(config: &HostConfig, net: &Net) {
+    if let Ok(mut h) = net.handshake.try_borrow_mut() {
+        h.set_map_sharing(config.map_sharing);
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        crate::replayrec::set_enabled(config.record_replays);
+        crate::createscreen::set_auto_game_name(config.auto_game_name);
+        crate::apm::configure(config);
+        crate::netpanel::configure(config);
+        crate::ping::configure(config);
+        crate::settingsscreen::set_hide_arrows(config.hide_scrollbar_arrows);
+    }
+}
+
+/// Where the screen's host and plugin values live: `host.json`, `sharing.json` and each plugin's
+/// `config\<id>.json`.
+// Built only by the x86 options screen; kept on every target so the tests below run on all.
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+struct SessionOwners<'a> {
+    config: &'a mut HostConfig,
+    root: &'a Path,
+    plugins: &'a Registry,
+    net: &'a Net,
+}
+
+impl settings::Owners for SessionOwners<'_> {
+    fn load(&self, def: &SettingDef) -> Option<settings::Value> {
+        match &def.owner {
+            Owner::Host if def.key == hostsettings::SHARE_MATCH_DATA => Some(
+                settings::Value::Int(i64::from(crate::uploader::enabled())),
+            ),
+            Owner::Host => hostsettings::read(self.config, &def.key).map(settings::Value::Int),
+            Owner::Plugin(id) => {
+                match (self.plugins.find(id)?.stored_setting(&def.key)?, def.kind) {
+                    (Val::Str(v), k) if k.is_text() => Some(settings::Value::Str(v)),
+                    (Val::Int(n), k) if !k.is_text() => Some(settings::Value::Int(n)),
+                    // The wrong type in the file: the plugin wrote something else under the key.
+                    _ => None,
+                }
+            }
+            Owner::Game => None,
+        }
+    }
+
+    fn store(&mut self, changed: &[(&SettingDef, &settings::Value)]) {
+        let mut host_changed = false;
+        let mut notify: Vec<&str> = Vec::new();
+        for (d, v) in changed {
+            match &d.owner {
+                Owner::Host if d.key == hostsettings::SHARE_MATCH_DATA => {
+                    let on = v.int() != 0;
+                    let line = match crate::uploader::set_enabled(self.root, on) {
+                        Ok(()) => format!("share_match_data {}", if on { "on" } else { "off" }),
+                        Err(e) => format!("cannot write sharing.json: {e}"),
+                    };
+                    StartupLog.line(W2R_LOG_INFO, "host", &line);
+                }
+                Owner::Host => {
+                    if hostsettings::write(self.config, &d.key, v.int()) {
+                        host_changed = true;
+                        StartupLog.line(
+                            W2R_LOG_INFO,
+                            "host",
+                            &format!("{} = {}", d.key, v.int()),
+                        );
+                    }
+                }
+                Owner::Plugin(id) => {
+                    let Some(slot) = self.plugins.find(id) else {
+                        continue;
+                    };
+                    let value = match v {
+                        settings::Value::Int(n) => Val::Int(*n),
+                        settings::Value::Str(t) => Val::Str(t.clone()),
+                    };
+                    if let Err(e) = slot.store_setting(&d.key, value) {
+                        slot.log(W2R_LOG_ERROR, &e);
+                    }
+                    if !notify.contains(&id.as_str()) {
+                        notify.push(id);
+                    }
+                }
+                Owner::Game => {}
+            }
+        }
+        if host_changed {
+            if let Err(e) = hostcfg::write(self.root, self.config) {
+                StartupLog.line(
+                    W2R_LOG_ERROR,
+                    "host",
+                    &format!("cannot write {}: {e}", hostcfg::FILE),
+                );
+            }
+            apply_host_config(self.config, self.net);
+        }
+        // After every value is stored, so a plugin reading one setting on the event sees the
+        // others too.
+        for id in notify {
+            if let Some(slot) = self.plugins.find(id) {
+                self.plugins.settings_changed(slot);
+            }
+        }
+    }
+}
+
+/// The plugin manager's rows: every plugin `state.json` lists, with what it says about itself and
+/// what the host did with it this session.
+fn plugin_rows(
+    state: &State,
+    registry: &Registry,
+    info: &BTreeMap<String, plugins::PluginInfo>,
+    enabled_at_start: &BTreeSet<String>,
+) -> Vec<PluginRow> {
+    state
+        .plugins
+        .iter()
+        .map(|p| {
+            let about = info.get(&p.id);
+            let launched = enabled_at_start.contains(&p.id);
+            let (running, slow, error) = match registry.find(&p.id) {
+                Some(slot) => match slot.state() {
+                    SlotState::Active => (true, slot.is_slow(), None),
+                    SlotState::Disabled { reason } => (false, false, Some(reason)),
+                },
+                // Enabled at launch but refused before it was loaded.
+                None if launched => (
+                    false,
+                    false,
+                    Some("not loaded; w2r.log says why".to_owned()),
+                ),
+                None => (false, false, None),
+            };
+            PluginRow {
+                id: p.id.clone(),
+                name: about.map_or_else(|| p.id.clone(), |a| a.name.clone()),
+                version: state_version(p),
+                author: about.map(|a| a.author.clone()),
+                description: about.map(|a| a.description.clone()),
+                enabled: p.enabled,
+                enabled_at_launch: launched,
+                running,
+                slow,
+                error,
+            }
+        })
+        .collect()
+}
+
+/// Draws the plugin manager's list with `w` and saves the user's enable toggles to state.json.
+/// Called from the main menu's plugin popup.
+pub fn draw_plugin_list(w: &dyn Widgets) {
     SESSION.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
-            return Action::None;
+            return;
         };
-        let Some(session) = slot.as_mut() else {
-            return Action::None;
+        let Some(s) = slot.as_mut() else {
+            return;
         };
-        let mut rows: Vec<PluginRow> = session
-            .state
-            .plugins
-            .iter()
-            .map(|p| {
-                let (status, slow) = match session.registry.find(&p.id) {
-                    Some(s) => match s.state() {
-                        SlotState::Active => (Status::Active, s.is_slow()),
-                        SlotState::Disabled { reason } => (Status::Disabled(reason), false),
-                    },
-                    None => (Status::NotLoaded, false),
-                };
-                PluginRow {
-                    id: p.id.clone(),
-                    version: state_version(p),
-                    author: session.authors.get(&p.id).cloned(),
-                    enabled: p.enabled,
-                    status,
-                    slow,
-                }
-            })
-            .collect();
-        let mut host = HostRow {
-            fingerprint: session.fingerprint,
-            simulation: session.simulation.clone(),
-            lock_teams: session.config.lock_team_changes,
-            lock_slots: session.config.lock_slot_swaps,
-            create_screen: session.config.enhanced_create_screen,
-            lobby_screen: session.config.enhanced_lobby_screen,
-            map_sharing: session.config.map_sharing,
-            auto_download: session.config.auto_download,
-            record_replays: session.config.record_replays,
-            auto_game_name: session.config.auto_game_name,
-            apm_display: session.config.apm_display,
-            apm_alert_below: session.config.apm_alert_below,
-            apm_color_text: session.config.apm_color_text,
-            apm_play_sound: session.config.apm_play_sound,
-            minimap_ping: session.config.minimap_ping,
-            net_panel: session.config.net_panel,
-            share_match_data: crate::uploader::enabled(),
-        };
-        let registry = &session.registry;
+        let mut rows = plugin_rows(&s.state, &s.registry, &s.plugin_info, &s.enabled_at_start);
+        let plugins = &s.registry;
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-        let action = ui::draw_plugin_screen(w, &mut host, &mut rows, |w, i| {
-            if let Some(s) = registry.find(&ids[i]) {
-                ui::with_frame(w, |table| registry.call_on_ui(s, table));
+        let action = ui::draw_plugin_list(w, s.fingerprint, &s.simulation, &mut rows, |w, i| {
+            if let Some(slot) = plugins.find(&ids[i]) {
+                ui::with_frame(w, |table| plugins.call_on_ui(slot, table));
             }
         });
-        match action {
-            Action::Toggle(i) => {
-                let row = &rows[i];
-                session.state.set_enabled(&row.id, row.enabled);
-                let path = session.root.join("config").join("state.json");
-                match state::write(&path, &session.state) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "{} {} for the next launch",
-                            row.id,
-                            if row.enabled { "enabled" } else { "disabled" }
-                        ),
+        if let Action::Toggle(i) = action {
+            let row = &rows[i];
+            s.state.set_enabled(&row.id, row.enabled);
+            let path = s.root.join("config").join("state.json");
+            match state::write(&path, &s.state) {
+                Ok(()) => StartupLog.line(
+                    W2R_LOG_INFO,
+                    "host",
+                    &format!(
+                        "{} {} for the next launch",
+                        row.id,
+                        if row.enabled { "enabled" } else { "disabled" }
                     ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write state.json: {e}"),
-                    ),
-                }
+                ),
+                Err(e) => StartupLog.line(
+                    W2R_LOG_ERROR,
+                    "host",
+                    &format!("cannot write state.json: {e}"),
+                ),
             }
-            Action::ToggleLocks => {
-                save_locks(session, host.lock_teams, host.lock_slots);
-            }
-            Action::ToggleMapSharing => {
-                session.config.map_sharing = host.map_sharing;
-                session.config.auto_download = host.auto_download;
-                match hostcfg::write(&session.root, &session.config) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "map sharing {}, auto download {}",
-                            if host.map_sharing { "on" } else { "off" },
-                            if host.auto_download { "on" } else { "off" }
-                        ),
-                    ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    ),
-                }
-                if let Ok(mut h) = session.net.handshake.try_borrow_mut() {
-                    h.set_map_sharing(host.map_sharing);
-                }
-            }
-            Action::ToggleAutoGameName => {
-                session.config.auto_game_name = host.auto_game_name;
-                #[cfg(target_arch = "x86")]
-                crate::createscreen::set_auto_game_name(host.auto_game_name);
-                match hostcfg::write(&session.root, &session.config) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "auto_game_name {}",
-                            if host.auto_game_name { "on" } else { "off" }
-                        ),
-                    ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    ),
-                }
-            }
-            Action::ToggleMinimapPing => {
-                session.config.minimap_ping = host.minimap_ping;
-                crate::ping::configure(&session.config);
-                if let Err(e) = hostcfg::write(&session.root, &session.config) {
-                    StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    );
-                }
-            }
-            Action::ToggleNetPanel => {
-                session.config.net_panel = host.net_panel;
-                crate::netpanel::configure(&session.config);
-                if let Err(e) = hostcfg::write(&session.root, &session.config) {
-                    StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    );
-                }
-            }
-            Action::ChangeApm => {
-                session.config.apm_display = host.apm_display;
-                session.config.apm_alert_below = host.apm_alert_below;
-                session.config.apm_color_text = host.apm_color_text;
-                session.config.apm_play_sound = host.apm_play_sound;
-                crate::apm::configure(&session.config);
-                if let Err(e) = hostcfg::write(&session.root, &session.config) {
-                    StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    );
-                }
-            }
-            Action::ToggleSharing => {
-                let line = match crate::uploader::set_enabled(&session.root, host.share_match_data)
-                {
-                    Ok(()) => format!(
-                        "share_match_data {}",
-                        if host.share_match_data { "on" } else { "off" }
-                    ),
-                    Err(e) => format!("cannot write sharing.json: {e}"),
-                };
-                StartupLog.line(W2R_LOG_INFO, "host", &line);
-            }
-            Action::ToggleRecording => {
-                session.config.record_replays = host.record_replays;
-                #[cfg(target_arch = "x86")]
-                crate::replayrec::set_enabled(host.record_replays);
-                match hostcfg::write(&session.root, &session.config) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "record_replays {}",
-                            if host.record_replays { "on" } else { "off" }
-                        ),
-                    ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    ),
-                }
-            }
-            Action::ToggleLobbyScreen => {
-                session.config.enhanced_lobby_screen = host.lobby_screen;
-                match hostcfg::write(&session.root, &session.config) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "enhanced_lobby_screen {}",
-                            if host.lobby_screen { "on" } else { "off" }
-                        ),
-                    ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    ),
-                }
-            }
-            Action::ToggleCreateScreen => {
-                session.config.enhanced_create_screen = host.create_screen;
-                match hostcfg::write(&session.root, &session.config) {
-                    Ok(()) => StartupLog.line(
-                        W2R_LOG_INFO,
-                        "host",
-                        &format!(
-                            "enhanced_create_screen {}",
-                            if host.create_screen { "on" } else { "off" }
-                        ),
-                    ),
-                    Err(e) => StartupLog.line(
-                        W2R_LOG_ERROR,
-                        "host",
-                        &format!("cannot write {}: {e}", hostcfg::FILE),
-                    ),
-                }
-            }
-            Action::None | Action::Back => {}
         }
-        action
+    });
+}
+
+/// What the options screen draws with: the session's parts, borrowed for one frame.
+#[cfg(target_arch = "x86")]
+struct SessionScreen<'a> {
+    editor: &'a mut Editor,
+    native: &'a mut dyn settings::Native,
+    owners: SessionOwners<'a>,
+}
+
+#[cfg(target_arch = "x86")]
+impl crate::settingsscreen::ScreenHost for SessionScreen<'_> {
+    fn parts(&mut self) -> (&mut Editor, &mut dyn settings::Native, &mut dyn settings::Owners) {
+        (&mut *self.editor, &mut *self.native, &mut self.owners)
+    }
+}
+
+/// Draws the options screen for `variant`. False when there is no session or the screen is not
+/// available, so the hook falls back to the game's own options screen.
+#[cfg(target_arch = "x86")]
+pub fn draw_settings_screen(variant: i32) -> bool {
+    if !crate::settingsscreen::available() {
+        return false;
+    }
+    SESSION.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return false;
+        };
+        let Some(s) = slot.as_mut() else {
+            return false;
+        };
+        let mut none = settings::NoNative;
+        let native: &mut dyn settings::Native = match s.native.as_mut() {
+            Some(bridge) => bridge,
+            None => &mut none,
+        };
+        let mut screen = SessionScreen {
+            editor: &mut s.editor,
+            native,
+            owners: SessionOwners {
+                config: &mut s.config,
+                root: &s.root,
+                plugins: &s.registry,
+                net: &s.net,
+            },
+        };
+        crate::settingsscreen::draw(variant, &mut screen)
     })
 }
 
@@ -974,6 +1025,11 @@ pub fn lobby_roles() -> (Option<u8>, [ModMark; 8], [String; 8]) {
     })
 }
 
+/// A line in the host's log, at `level`.
+pub fn host_line(level: u32, source: &str, msg: &str) {
+    StartupLog.line(level, source, msg);
+}
+
 pub fn log_error(source: &str, msg: &str) {
     StartupLog.line(W2R_LOG_ERROR, source, msg);
 }
@@ -1034,9 +1090,12 @@ fn start() -> Session {
             config: HostConfig::default(),
             fingerprint: [0; 4],
             simulation: Vec::new(),
-            authors: BTreeMap::new(),
-            enabled_at_start: 0,
+            plugin_info: BTreeMap::new(),
+            enabled_at_start: BTreeSet::new(),
             net,
+            editor: Editor::default(),
+            #[cfg(target_arch = "x86")]
+            native: None,
             #[cfg(target_arch = "x86")]
             nk: None,
         };
@@ -1111,6 +1170,7 @@ fn start() -> Session {
             (Some(_), Some(image)) => {
                 options::install(image, &symbols, &*log);
                 options::install_main_menu(image, &symbols, &*log);
+                crate::settingsscreen::install(image, &symbols, &*log);
                 crate::lobbycreate::install(image, &symbols, &*log);
                 crate::joinpassword::install(image, &symbols, &*log);
                 crate::gameinfopatch::install(image, symbols.base(), &*log);
@@ -1161,8 +1221,48 @@ fn start() -> Session {
         crate::createscreen::set_auto_game_name(config.auto_game_name);
         crate::replayplay::init(&startup.root, loaded.fingerprint);
     }
-    let authors = plugins::authors(&startup.root, &loaded.state);
-    let enabled_at_start = loaded.state.plugins.iter().filter(|p| p.enabled).count();
+    let plugin_info = plugins::infos(&startup.root, &loaded.state);
+    let enabled_at_start: BTreeSet<String> = loaded
+        .state
+        .plugins
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.id.clone())
+        .collect();
+    #[cfg(target_arch = "x86")]
+    let native = startup.image.as_ref().and_then(|image| {
+        match crate::nativesettings::game::Bridge::new(image, &symbols) {
+            Ok(bridge) => Some(bridge),
+            Err(why) => {
+                host_line(
+                    W2R_LOG_WARN,
+                    "settings",
+                    &format!("the game's settings table was refused ({why}); no game settings"),
+                );
+                None
+            }
+        }
+    });
+    #[cfg(target_arch = "x86")]
+    let entries = native.as_ref().map(|b| b.entries());
+    #[cfg(not(target_arch = "x86"))]
+    let entries: Option<Vec<crate::nativesettings::Entry>> = None;
+    let editor = Editor::new(settings_registry(
+        entries.as_deref(),
+        &loaded.registry,
+        &plugin_info,
+    ));
+    host_line(
+        W2R_LOG_INFO,
+        "settings",
+        &format!(
+            "{} settings on the options screen ({} categories)",
+            editor.registry.len(),
+            editor.registry.categories().len()
+        ),
+    );
+    #[cfg(target_arch = "x86")]
+    crate::settingsscreen::set_hide_arrows(config.hide_scrollbar_arrows);
     Session {
         registry: loaded.registry,
         lobby,
@@ -1171,9 +1271,12 @@ fn start() -> Session {
         config,
         fingerprint: loaded.fingerprint,
         simulation: loaded.simulation,
-        authors,
+        plugin_info,
         enabled_at_start,
         net,
+        editor,
+        #[cfg(target_arch = "x86")]
+        native,
         #[cfg(target_arch = "x86")]
         nk,
     }
@@ -1217,4 +1320,243 @@ fn transport(symbols: &Symbols, log: &dyn Log) -> Rc<dyn Transport> {
 #[cfg(not(target_arch = "x86"))]
 fn transport(_: &Symbols, _: &dyn Log) -> Rc<dyn Transport> {
     Rc::new(NoTransport)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::Services;
+    use crate::semver::Version;
+    use crate::settings::{Kind, Owners, Value};
+    use crate::state::PluginState;
+    use w2r_abi::*;
+
+    struct Quiet;
+    impl Log for Quiet {
+        fn line(&self, _: u32, _: &str, _: &str) {}
+    }
+
+    fn s(text: &str) -> W2rStr {
+        W2rStr {
+            ptr: text.as_ptr().cast(),
+            len: text.len() as u32,
+        }
+    }
+
+    fn int_setting(key: &'static str, category: &'static str) -> W2rSettingDef {
+        W2rSettingDef {
+            struct_size: W2R_SETTING_DEF_V1_SIZE,
+            kind: W2R_SETTING_INT,
+            default_int: 7,
+            min: 0,
+            max: 60,
+            flags: 0,
+            choice_count: 0,
+            choices: core::ptr::null(),
+            reserved: 0,
+            key: s(key),
+            label: s("Label"),
+            description: s(""),
+            category: s(category),
+            subcategory: s(""),
+            default_str: s(""),
+            active_when: s(""),
+        }
+    }
+
+    thread_local! {
+        static HOST: Cell<*const W2rHost> = const { Cell::new(core::ptr::null()) };
+        /// What the listening plugin read when it heard the settings changed.
+        static HEARD: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn read(h: &W2rHost, key: &str) -> i64 {
+        let mut n = -1;
+        unsafe { (h.settings_get_i64)(h.token, s(key), &mut n) };
+        n
+    }
+
+    unsafe extern "C" fn listener_load(host: *const W2rHost) -> W2rStatus {
+        HOST.with(|c| c.set(host));
+        let h = unsafe { &*host };
+        unsafe {
+            (h.settings_declare)(h.token, &int_setting("fade", ""));
+            (h.settings_declare)(h.token, &int_setting("lines", "Chat"));
+            (h.subscribe)(h.token, W2R_EVT_SETTINGS_CHANGED)
+        }
+    }
+    unsafe extern "C" fn listener_event(_: *const W2rEvent) {
+        let h = unsafe { &*HOST.with(|c| c.get()) };
+        HEARD.with(|v| v.borrow_mut().push((read(h, "fade"), read(h, "lines"))));
+    }
+    static LISTENER: W2rPlugin = W2rPlugin {
+        struct_size: W2R_PLUGIN_V1_SIZE,
+        on_load: Some(listener_load),
+        on_event: Some(listener_event),
+        on_ui: None,
+        on_unload: None,
+    };
+    unsafe extern "C" fn listener_entry(_: *const W2rHost) -> *const W2rPlugin {
+        &LISTENER
+    }
+
+    /// Declares a setting, then fails its load.
+    unsafe extern "C" fn refused_load(host: *const W2rHost) -> W2rStatus {
+        let h = unsafe { &*host };
+        unsafe { (h.settings_declare)(h.token, &int_setting("never", "")) };
+        W2R_E_STATE
+    }
+    static REFUSED: W2rPlugin = W2rPlugin {
+        struct_size: W2R_PLUGIN_V1_SIZE,
+        on_load: Some(refused_load),
+        on_event: None,
+        on_ui: None,
+        on_unload: None,
+    };
+    unsafe extern "C" fn refused_entry(_: *const W2rHost) -> *const W2rPlugin {
+        &REFUSED
+    }
+
+    fn root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("w2r-session-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        root
+    }
+
+    fn registry(root: &Path) -> Registry {
+        let services = Services {
+            root: Some(root.to_path_buf()),
+            ..Services::none()
+        };
+        let mut reg = Registry::with(Rc::new(Quiet), None, services);
+        reg.load_entry("w2r-chat", listener_entry).unwrap();
+        assert!(reg.load_entry("w2r-broken", refused_entry).is_err());
+        reg
+    }
+
+    fn info(name: &str) -> plugins::PluginInfo {
+        plugins::PluginInfo {
+            name: name.into(),
+            author: "Ann".into(),
+            description: "Does things.".into(),
+        }
+    }
+
+    #[test]
+    fn the_registry_has_the_hosts_and_active_plugins_settings() {
+        let root = root("registry");
+        let reg = registry(&root);
+        let names = BTreeMap::from([("w2r-chat".to_owned(), info("Chat"))]);
+        let r = settings_registry(None, &reg, &names);
+        let chat = Owner::Plugin("w2r-chat".into());
+        let fade = r.find(&chat, "fade").unwrap();
+        assert_eq!(r.def(fade).category, "Chat", "no category: the plugin's name");
+        assert_eq!(r.def(fade).source.as_deref(), Some("Chat"));
+        assert_eq!(r.def(r.find(&chat, "lines").unwrap()).category, "Chat");
+        assert!(
+            r.find(&Owner::Plugin("w2r-broken".into()), "never").is_none(),
+            "a plugin that failed to load contributes nothing"
+        );
+        assert!(r.find(&Owner::Host, "map_sharing").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owners_store_every_value_before_notifying_and_write_host_json_once() {
+        let root = root("owners");
+        let reg = registry(&root);
+        let r = settings_registry(None, &reg, &BTreeMap::new());
+        let chat = Owner::Plugin("w2r-chat".into());
+        let fade = r.def(r.find(&chat, "fade").unwrap()).clone();
+        let lines = r.def(r.find(&chat, "lines").unwrap()).clone();
+        let sharing = r.def(r.find(&Owner::Host, "map_sharing").unwrap()).clone();
+        let mut config = HostConfig::default();
+        let net = Net::idle();
+        let mut owners = SessionOwners {
+            config: &mut config,
+            root: &root,
+            plugins: &reg,
+            net: &net,
+        };
+        assert_eq!(owners.load(&fade), None, "never stored: the default is used");
+        HEARD.with(|v| v.borrow_mut().clear());
+        owners.store(&[
+            (&fade, &Value::Int(12)),
+            (&sharing, &Value::Int(0)),
+            (&lines, &Value::Int(30)),
+        ]);
+        assert_eq!(
+            HEARD.with(|v| v.borrow().clone()),
+            vec![(12, 30)],
+            "one event, after both values were stored"
+        );
+        assert_eq!(owners.load(&fade), Some(Value::Int(12)));
+        assert!(!config.map_sharing);
+        let (written, _) = hostcfg::read(&root);
+        assert!(!written.map_sharing);
+        // A value of the wrong type in the plugin's file is not used.
+        reg.find("w2r-chat")
+            .unwrap()
+            .store_setting("fade", Val::Str("x".into()))
+            .unwrap();
+        let owners = SessionOwners {
+            config: &mut config,
+            root: &root,
+            plugins: &reg,
+            net: &net,
+        };
+        assert_eq!(owners.load(&fade), None);
+        assert_eq!(fade.kind, Kind::Int);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn listed(id: &str, enabled: bool) -> PluginState {
+        PluginState {
+            id: id.into(),
+            version: Version {
+                major: 1,
+                minor: 2,
+                patch: 0,
+                pre: Vec::new(),
+            },
+            enabled,
+            sha256: [0; 32],
+            approved_capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plugin_rows_say_what_happened_to_each_plugin() {
+        let root = root("rows");
+        let reg = registry(&root);
+        let state = State {
+            plugins: vec![
+                listed("w2r-chat", false),
+                listed("w2r-broken", true),
+                listed("w2r-missing", true),
+                listed("w2r-off", false),
+            ],
+        };
+        let info = BTreeMap::from([("w2r-chat".to_owned(), info("Chat"))]);
+        let launched = BTreeSet::from([
+            "w2r-chat".to_owned(),
+            "w2r-broken".to_owned(),
+            "w2r-missing".to_owned(),
+        ]);
+        let rows = plugin_rows(&state, &reg, &info, &launched);
+        let chat = &rows[0];
+        assert_eq!((chat.name.as_str(), chat.version.as_str()), ("Chat", "1.2.0"));
+        assert!(chat.running && chat.enabled_at_launch && !chat.enabled);
+        assert_eq!(chat.author.as_deref(), Some("Ann"));
+        assert!(rows[1].error.as_deref().unwrap().starts_with("E_LOAD"));
+        assert!(!rows[1].running);
+        assert_eq!(rows[2].name, "w2r-missing", "no manifest: the id");
+        assert_eq!(
+            rows[2].error.as_deref(),
+            Some("not loaded; w2r.log says why")
+        );
+        assert_eq!(rows[3].error, None, "switched off is not an error");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

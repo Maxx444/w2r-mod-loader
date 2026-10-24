@@ -148,7 +148,10 @@ impl Registry {
         };
         slot.table.set(table);
 
-        match guarded(|| unsafe { on_load(host) }) {
+        slot.set_loading(true);
+        let loaded = guarded(|| unsafe { on_load(host) });
+        slot.set_loading(false);
+        match loaded {
             Ok(W2R_OK) => Ok(index),
             Ok(status) => Err(self.refuse(index, "E_LOAD", format!("on_load returned {status}"))),
             Err(fault) => Err(self.refuse(index, "E_LOAD", format!("on_load faulted: {fault}"))),
@@ -169,17 +172,9 @@ impl Registry {
             payload,
         };
         for slot in &self.slots {
-            if !slot.is_active() || !slot.subscribed(id) {
-                continue;
+            if slot.is_active() && slot.subscribed(id) {
+                deliver(slot, &event);
             }
-            let Some(on_event) = slot.table.get().on_event else {
-                continue;
-            };
-            let started = std::time::Instant::now();
-            if let Err(fault) = guarded(|| unsafe { on_event(&event) }) {
-                slot.disable(format!("on_event({id}): {fault}"));
-            }
-            slot.note_duration(started.elapsed().as_millis(), "on_event");
         }
     }
 
@@ -223,6 +218,20 @@ impl Registry {
             slot.disable(format!("on_event({W2R_EVT_PEER_MESSAGE}): {fault}"));
         }
         true
+    }
+
+    /// `W2R_EVT_SETTINGS_CHANGED` to one plugin, if it is active and subscribed: the options
+    /// screen stored new values for it.
+    pub fn settings_changed(&self, slot: &Slot) {
+        if !slot.is_active() || !slot.subscribed(W2R_EVT_SETTINGS_CHANGED) {
+            return;
+        }
+        let event = W2rEvent {
+            struct_size: size_of::<W2rEvent>() as u32,
+            id: W2R_EVT_SETTINGS_CHANGED,
+            payload: core::ptr::null(),
+        };
+        deliver(slot, &event);
     }
 
     pub fn slots(&self) -> impl Iterator<Item = &Slot> {
@@ -275,6 +284,18 @@ impl Registry {
             }
         }
     }
+}
+
+/// Calls one plugin's `on_event` under the guard; a fault disables the plugin.
+fn deliver(slot: &Slot, event: &W2rEvent) {
+    let Some(on_event) = slot.table.get().on_event else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    if let Err(fault) = guarded(|| unsafe { on_event(event) }) {
+        slot.disable(format!("on_event({}): {fault}", event.id));
+    }
+    slot.note_duration(started.elapsed().as_millis(), "on_event");
 }
 
 #[cfg(test)]
@@ -526,6 +547,73 @@ mod tests {
         assert_eq!(disabled_lines, 1);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn settings_changed_reaches_only_its_subscribed_plugin_and_a_fault_disables_it() {
+        static HEARD: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn listens(host: *const W2rHost) -> W2rStatus {
+            let h = unsafe { &*host };
+            unsafe { (h.subscribe)(h.token, W2R_EVT_SETTINGS_CHANGED) }
+        }
+        unsafe extern "C" fn deaf(_: *const W2rHost) -> W2rStatus {
+            W2R_OK
+        }
+        unsafe extern "C" fn heard(event: *const W2rEvent) {
+            assert_eq!(unsafe { (*event).id }, W2R_EVT_SETTINGS_CHANGED);
+            HEARD.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn crash(_: *const W2rEvent) {
+            let p: *mut u32 = std::hint::black_box(core::ptr::null_mut());
+            unsafe { p.write_volatile(1) };
+        }
+        static LISTENS: W2rPlugin = W2rPlugin {
+            struct_size: W2R_PLUGIN_V1_SIZE,
+            on_load: Some(listens),
+            on_event: Some(heard),
+            on_ui: None,
+            on_unload: None,
+        };
+        static DEAF: W2rPlugin = W2rPlugin {
+            struct_size: W2R_PLUGIN_V1_SIZE,
+            on_load: Some(deaf),
+            on_event: Some(heard),
+            on_ui: None,
+            on_unload: None,
+        };
+        static CRASHES: W2rPlugin = W2rPlugin {
+            struct_size: W2R_PLUGIN_V1_SIZE,
+            on_load: Some(listens),
+            on_event: Some(crash),
+            on_ui: None,
+            on_unload: None,
+        };
+        unsafe extern "C" fn listens_entry(_: *const W2rHost) -> *const W2rPlugin {
+            &LISTENS
+        }
+        unsafe extern "C" fn deaf_entry(_: *const W2rHost) -> *const W2rPlugin {
+            &DEAF
+        }
+        unsafe extern "C" fn crashes_entry(_: *const W2rHost) -> *const W2rPlugin {
+            &CRASHES
+        }
+
+        let (mut reg, _) = registry();
+        reg.load_entry("listens", listens_entry).unwrap();
+        reg.load_entry("deaf", deaf_entry).unwrap();
+        reg.load_entry("crashes", crashes_entry).unwrap();
+        reg.settings_changed(reg.find("deaf").unwrap());
+        assert_eq!(HEARD.load(Ordering::Relaxed), 0, "not subscribed");
+        reg.settings_changed(reg.find("listens").unwrap());
+        assert_eq!(HEARD.load(Ordering::Relaxed), 1);
+        reg.settings_changed(reg.find("crashes").unwrap());
+        let State::Disabled { reason } = reg.find("crashes").unwrap().state() else {
+            panic!("still active")
+        };
+        assert!(reason.starts_with("on_event(9): access violation"), "{reason}");
+        reg.settings_changed(reg.find("crashes").unwrap());
+        assert!(reg.find("listens").unwrap().is_active());
+    }
+
     #[test]
     fn host_log_and_subscribe_validate_their_arguments() {
         unsafe extern "C" fn on_load(_: *const W2rHost) -> W2rStatus {
@@ -544,7 +632,7 @@ mod tests {
         let (mut reg, log) = registry();
         let i = reg.load_entry("p", entry).unwrap();
         let h = unsafe { &*reg.slot(i).host() };
-        assert_eq!(h.struct_size, W2R_HOST_MAP_FOLDER_SIZE);
+        assert_eq!(h.struct_size, W2R_HOST_SETTINGS_DECLARE_SIZE);
         assert_eq!(h.abi_version, W2R_ABI_VERSION);
 
         let long = "x".repeat(W2R_MAX_LOG_BYTES as usize + 1);

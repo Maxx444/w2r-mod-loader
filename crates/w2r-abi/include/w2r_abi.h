@@ -70,6 +70,11 @@ enum { W2R_FILE_READ = 1, W2R_FILE_WRITE = 2 /* create or truncate */ };
 #define W2R_MAX_CHAT_BYTES 200u
 #define W2R_PEER_HEADER_BYTES 9u   /* 0xE7 'W' '2' 'R' 'P' tag[4] */
 #define W2R_MAX_PEER_PAYLOAD 960u
+#define W2R_MAX_SETTING_LABEL 64u
+#define W2R_MAX_SETTING_DESCRIPTION 256u
+#define W2R_MAX_SETTING_CATEGORY 32u
+#define W2R_MAX_SETTING_CHOICE 64u      /* chars in one dropdown choice */
+#define W2R_MAX_SETTING_CHOICE_COUNT 16u     /* number of choices in one dropdown */
 
 /* ---- events ---------------------------------------------------------------------------- */
 typedef uint32_t W2rEventId;
@@ -110,6 +115,40 @@ typedef struct W2rEvtPeerMessage {
     uint32_t net_slot; /* the slot the transport reported, never one named inside the message */
     W2rBuf data;       /* the payload after the 9-byte header */
 } W2rEvtPeerMessage;
+
+/* ---- declared settings (settings_declare; docs/abi.md, "Declared settings") ------------- */
+enum {
+    W2R_SETTING_BOOL = 0,   /* a checkbox; settings_set_i64 with 0 or 1 */
+    W2R_SETTING_INT = 1,    /* settings_set_i64; a slider when min < max, read-only otherwise */
+    W2R_SETTING_CHOICE = 2, /* a dropdown over choices; settings_set_i64 with the index */
+    W2R_SETTING_STRING = 3, /* a text box; settings_set_str */
+    W2R_SETTING_COLOR = 4   /* a color picker; settings_set_str with six hex digits, "rrggbb" */
+};
+#define W2R_SETTING_HIDDEN 1u /* flags: stored and readable as usual, never shown */
+
+/* Every string is copied during the call. Fields a kind does not use are ignored. The order keeps
+   every field at the same offset under any 32-bit compiler (each 64-bit field 8-aligned, the size a
+   multiple of 8). */
+typedef struct W2rSettingDef {
+    uint32_t struct_size;  /* W2R_SETTING_DEF_V1_SIZE */
+    uint32_t kind;         /* W2R_SETTING_* */
+    int64_t default_int;   /* bool 0/1, int value, choice index */
+    int64_t min, max;      /* W2R_SETTING_INT only, inclusive; min == max draws no slider */
+    uint32_t flags;        /* W2R_SETTING_HIDDEN or 0 */
+    uint32_t choice_count;
+    const W2rStr *choices; /* W2R_SETTING_CHOICE only: 2..W2R_MAX_SETTING_CHOICE_COUNT labels */
+    uint32_t reserved;     /* must be 0 */
+    W2rStr key;            /* the settings key, same rule as settings_set_* */
+    W2rStr label;          /* the row's text, Title Case */
+    W2rStr description;    /* hover text; may be empty */
+    W2rStr category;       /* left-hand list entry, shared across plugins; empty = plugin name */
+    W2rStr subcategory;    /* heading inside the category; empty = "General" */
+    W2rStr default_str;    /* W2R_SETTING_STRING, or W2R_SETTING_COLOR as "rrggbb" */
+    W2rStr active_when;    /* greyed while this BOOL is off: an earlier key of this plugin, or
+                              "host:<key>" for one of the host's; empty = always active */
+} W2rSettingDef;
+
+#define W2R_SETTING_DEF_V1_SIZE ((uint32_t)sizeof(W2rSettingDef))
 
 /* ---- UI (only valid inside on_ui) ------------------------------------------------------ */
 typedef struct W2rUi {
@@ -188,10 +227,17 @@ typedef struct W2rHost {
        maps in `folder` (under the maps folder, subfolders included); empty removes the limit. The
        limit lasts until the callback returns, so call it first, every frame. */
     W2rStatus (W2R_CALL *create_map_folder)(void *token, W2rStr folder);
+
+    /* Appended after create_map_folder: check host->struct_size >= W2R_HOST_SETTINGS_DECLARE_SIZE.
+       Only inside on_load. Declares one of the plugin's own settings for the host's options
+       screen, which edits it for the plugin; W2R_EVT_SETTINGS_CHANGED says when it did. A declared
+       key that was never stored reads as its default. */
+    W2rStatus (W2R_CALL *settings_declare)(void *token, const W2rSettingDef *def);
 } W2rHost;
 
 #define W2R_HOST_CREATE_UI_SIZE (offsetof(W2rHost, create_map_select) + sizeof(void *))
 #define W2R_HOST_MAP_FOLDER_SIZE (offsetof(W2rHost, create_map_folder) + sizeof(void *))
+#define W2R_HOST_SETTINGS_DECLARE_SIZE (offsetof(W2rHost, settings_declare) + sizeof(void *))
 
 /* ---- plugin table: returned by the plugin ---------------------------------------------- */
 typedef struct W2rPlugin {

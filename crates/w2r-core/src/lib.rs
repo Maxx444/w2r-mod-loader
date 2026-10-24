@@ -15,6 +15,7 @@ pub mod pingtable;
 pub mod build_guard;
 pub mod chat;
 pub mod chatclick;
+pub mod color;
 pub mod createpick;
 pub mod dispatch;
 pub mod downloadclient;
@@ -27,6 +28,7 @@ pub mod handshake;
 pub mod hooks;
 pub mod host;
 pub mod hostcfg;
+pub mod hostsettings;
 pub mod lobby;
 pub mod lobbylayout;
 pub mod lobbyratings;
@@ -52,7 +54,9 @@ pub use w2r_preview::pud;
 pub mod pudvalidate;
 pub mod scoreboard;
 pub mod kickpanel;
+pub mod nativesettings;
 pub mod screenkit;
+pub mod settings;
 pub mod store;
 pub mod symbols;
 pub mod target;
@@ -106,6 +110,8 @@ pub mod matchend;
 pub mod matchstart;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod options;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod settingsscreen;
 pub mod plugincmd;
 #[cfg(windows)]
 pub mod paths;

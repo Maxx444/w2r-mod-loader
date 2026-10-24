@@ -1,12 +1,14 @@
-//! The game's options screen, taken over for the plugin list: the host hooks
-//! `BuildOptionsMenuScreen` and draws a small "Plugins" button over the game's own screen; while
-//! the user is on the plugin screen the game's screen is not built at all and ours is, with the
-//! game's own menu widgets and skins. Layout numbers are in the game's 2160-high UI space and
-//! follow wc2r-plus's settings screen (MIT). x86 only.
+//! The game's options screen hook: `BuildOptionsMenuScreen` hands both its entries (the main
+//! menu's and the pause menu's) to the settings screen (`settingsscreen.rs`,
+//! docs/settings-screen.md), and the game's own screen is not built at all. Also the title
+//! screen's version lines with the Manage button, the plugin manager popup it opens, and the
+//! game's menu widgets behind [`Widgets`], which the popup draws plugin cards and `on_ui` rows
+//! with. Layout numbers are in the game's 2160-high UI space. x86 only.
 
 use core::ffi::{c_char, c_void};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use w2r_abi::{W2R_LOG_ERROR, W2R_LOG_INFO};
 
@@ -18,34 +20,38 @@ use crate::symbols::Symbols;
 use crate::ui::Widgets;
 
 pub const SYMBOL: &str = "BuildOptionsMenuScreen";
-const UI_HEIGHT: f32 = 2160.0;
-const PANEL_TOP: f32 = 320.0;
-const PANEL_HEIGHT: f32 = 1580.0;
-const PANEL_WIDTH_PERCENT: f32 = 60.0;
-const TITLE_TOP: f32 = 150.0;
-const TITLE_HEIGHT: f32 = 120.0;
-const BUTTON_W: f32 = 380.0;
-const BUTTON_H: f32 = 100.0;
-const ALIGN_TITLE: i32 = 0x12;
 const ALIGN_ROW: i32 = 0x11;
+const ALIGN_TITLE: i32 = 0x12;
+const ALIGN_RIGHT: i32 = 0x14;
 const WINDOW_NO_SCROLLBAR: u32 = 0x20;
 /// Nuklear's NK_WINDOW_NO_INPUT: the window never takes the mouse from what is under it.
 const WINDOW_NO_INPUT: u32 = 0x400;
 /// Nuklear's NK_WINDOW_BACKGROUND: kept behind every other window, so it never overlaps (and
 /// turns read-only) the game's own screen drawn before it.
 const WINDOW_BACKGROUND: u32 = 0x100;
-const GROUP_PLAIN: u32 = 0;
 /// A group without scrollbars, as the create screen's frames.
 const GROUP_CARD: u32 = 0x20;
 /// The edit box's flags and the row spacing offset in the game's Nuklear context, as the other
 /// screens use them (`screenkit.rs`, wc2r-plus `struct_offsets.h`).
 const TEXT_EDIT_FLAGS: u32 = 0x260;
+const CTX_SPACING_X: usize = 0x2000;
 const CTX_SPACING_Y: usize = 0x2004;
-/// The plugin screen's breathing room: a left margin (a fraction of the row, taken by an empty
-/// first cell) and the gap between rows (the context's item spacing, in UI units).
+const CTX_FONT: usize = 0x1e0;
+const CTX_TEXT_COLOUR: usize = 0x20c;
+const CTX_CURRENT_WINDOW: usize = 0x3d28;
+const WINDOW_BUFFER: usize = 0x64;
+const WINDOW_PANEL: usize = 0x8c;
+const PANEL_BOUNDS_W: usize = 0x10;
+const USER_FONT_HEIGHT: usize = 0x04;
+const CTX_MOUSE_X: usize = 0x1bc;
+const CTX_MOUSE_Y: usize = 0x1c0;
+/// The left mouse button: non-zero while held, and whether it went down this frame.
+const CTX_MOUSE_LEFT_DOWN: usize = 0x17c;
+const CTX_MOUSE_LEFT_CLICKED: usize = 0x180;
+/// The plugin cards' breathing room: a left margin, a fraction of the row taken by an empty
+/// first cell.
 const ROW_INSET: f32 = 0.02;
 const CARD_INSET: f32 = 0.05;
-const ROW_GAP: f32 = crate::ui::ROW_GAP;
 
 /// Column ratios for rows of 1 to 8 widgets after the margin cell. The game's layout keeps the
 /// pointer it is given and reads it as each widget of the row is placed, so these must outlive
@@ -87,18 +93,11 @@ type MenuButtonFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> i8;
 type CheckboxFn = unsafe extern "C" fn(*const c_char, *mut u32, u32) -> u8;
 type SliderFn = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u32) -> u8;
 type TextEditFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_char, i32, *mut c_void) -> u32;
-/// Found in `BuildOptionsMenuScreen` (0x5429a0) for the pause-menu variant: the popup's
-/// rectangle function `(out x,y,w,h, scale)` and its skin globals (alt flag 1 uses the alt).
-const POPUP_LAYOUT: usize = 0x0054_7320;
-const PAUSE_SKIN: usize = 0x0095_dd84;
-const PAUSE_SKIN_ALT: usize = 0x0095_dd88;
-type PopupLayoutFn = unsafe extern "C" fn(*mut [f32; 4], f32) -> *mut [f32; 4];
-fn rebase(symbols: &Symbols, static_addr: usize) -> usize {
-    symbols.base() + (static_addr - 0x0040_0000)
-}
-/// Frame room around the in-game popup's contents.
-const POPUP_MARGIN: f32 = 60.0;
 type SetSkinFn = unsafe extern "thiscall" fn(*mut c_void, u32) -> u32;
+type CountLinesFn = unsafe extern "C" fn(*mut c_void, *const c_char, i32, f32) -> i32;
+type WrappedLabelFn = unsafe extern "C" fn(*mut c_void, *const c_char, u32);
+type FillRectFn = unsafe extern "C" fn(*mut c_void, f32, f32, f32, f32, f32, u32);
+type WidgetSpaceFn = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void, i32);
 
 /// The game functions the screen needs, resolved once. Plain pointers, so copies are cheap and
 /// the session need not stay borrowed while the screen draws.
@@ -127,14 +126,15 @@ pub struct Nk {
     skin_text_edit: *const u32,
     set_skin: SetSkinFn,
     skin_manager: *mut c_void,
+    skin_card: *const u32,
     skin_window: *const u32,
     skin_window_alt: *const u32,
     skin_alt_flag: *const u8,
     skin_content: *const u32,
-    skin_card: *const u32,
-    skin_pause: *const u32,
-    skin_pause_alt: *const u32,
-    popup_layout: PopupLayoutFn,
+    count_lines: CountLinesFn,
+    wrapped_label: WrappedLabelFn,
+    fill_rect: FillRectFn,
+    widget_space: WidgetSpaceFn,
 }
 
 macro_rules! sym {
@@ -169,16 +169,15 @@ impl Nk {
             skin_text_edit: symbols.address("SkinTextEdit")? as *const u32,
             set_skin: sym!(symbols, "SetSkin", SetSkinFn),
             skin_manager: symbols.address("SkinManager")? as *mut c_void,
+            skin_card: symbols.address("SkinLobbyCreationLeft")? as *const u32,
             skin_window: symbols.address("SkinWindow")? as *const u32,
             skin_window_alt: symbols.address("SkinWindowAlt")? as *const u32,
             skin_alt_flag: symbols.address("SkinAltFlag")? as *const u8,
             skin_content: symbols.address("SkinContentPanel")? as *const u32,
-            skin_card: symbols.address("SkinLobbyCreationLeft")? as *const u32,
-            skin_pause: rebase(symbols, PAUSE_SKIN) as *const u32,
-            skin_pause_alt: rebase(symbols, PAUSE_SKIN_ALT) as *const u32,
-            popup_layout: unsafe {
-                core::mem::transmute::<usize, PopupLayoutFn>(rebase(symbols, POPUP_LAYOUT))
-            },
+            count_lines: sym!(symbols, "CountWrappedLines", CountLinesFn),
+            wrapped_label: sym!(symbols, "DrawWrappedLabel", WrappedLabelFn),
+            fill_rect: sym!(symbols, "NkFillRect", FillRectFn),
+            widget_space: sym!(symbols, "NkLayoutWidgetSpace", WidgetSpaceFn),
         })
     }
 
@@ -190,24 +189,52 @@ impl Nk {
         unsafe { (self.set_skin)(self.skin_manager, id) }
     }
 
-    pub(crate) fn pause_skin(&self) -> u32 {
-        unsafe {
-            if *self.skin_alt_flag == 1 {
-                *self.skin_pause_alt
-            } else {
-                *self.skin_pause
-            }
-        }
+    fn alt(&self) -> bool {
+        unsafe { *self.skin_alt_flag == 1 }
     }
 
-    pub(crate) fn window_skin(&self) -> u32 {
+    fn window_skin(&self) -> u32 {
         unsafe {
-            if *self.skin_alt_flag != 0 {
+            if self.alt() {
                 *self.skin_window_alt
             } else {
                 *self.skin_window
             }
         }
+    }
+
+    /// How wide `text` is drawn: the narrowest width the game's line counter fits it on one line
+    /// in. Remembered per text.
+    fn text_width(&self, text: &str) -> f32 {
+        thread_local! {
+            static WIDTHS: RefCell<HashMap<String, f32>> = RefCell::new(HashMap::new());
+        }
+        if let Some(w) = WIDTHS.with(|m| m.borrow().get(text).copied()) {
+            return w;
+        }
+        let ctx = self.ctx();
+        if ctx.is_null() || text.is_empty() {
+            return 0.0;
+        }
+        let t = cstr(text);
+        let lines = |width: f32| unsafe {
+            (self.count_lines)(ctx, t.as_ptr().cast(), (t.len() - 1) as i32, width)
+        };
+        let (mut lo, mut hi) = (0.0f32, 4096.0f32);
+        if lines(hi) > 1 {
+            return hi;
+        }
+        while hi - lo > 1.0 {
+            let mid = (lo + hi) * 0.5;
+            if lines(mid) <= 1 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let width = hi.ceil();
+        WIDTHS.with(|m| m.borrow_mut().insert(text.to_owned(), width));
+        width
     }
 }
 
@@ -227,9 +254,70 @@ pub struct GameWidgets<'a> {
     ctx: *mut c_void,
     /// Inside a plugin card (wider margins).
     in_card: Cell<bool>,
+    /// Column ratios of `row_cells` rows. The game's layout reads them while the row's widgets
+    /// are placed, so they live as long as the widgets.
+    ratios: RefCell<Vec<Box<[f32]>>>,
 }
 
 impl<'a> GameWidgets<'a> {
+    /// The widgets on `ctx`, the game's menu context of this frame.
+    pub fn new(nk: &'a Nk, ctx: *mut c_void) -> GameWidgets<'a> {
+        GameWidgets {
+            nk,
+            ctx,
+            in_card: Cell::new(false),
+            ratios: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn read_f32(&self, offset: usize) -> f32 {
+        unsafe { (self.ctx as *const u8).add(offset).cast::<f32>().read_unaligned() }
+    }
+
+    fn inset(&self) -> f32 {
+        if self.in_card.get() {
+            CARD_INSET
+        } else {
+            ROW_INSET
+        }
+    }
+
+    /// The current panel's width, and the space a row of `cells` cells (margins included) has
+    /// after the gaps between them.
+    fn usable(&self, cells: usize) -> f32 {
+        let win = unsafe {
+            (self.ctx as *const u8)
+                .add(CTX_CURRENT_WINDOW)
+                .cast::<*const u8>()
+                .read_unaligned()
+        };
+        if win.is_null() {
+            return 0.0;
+        }
+        let panel = unsafe { win.add(WINDOW_PANEL).cast::<*const u8>().read_unaligned() };
+        if panel.is_null() {
+            return 0.0;
+        }
+        let width = unsafe { panel.add(PANEL_BOUNDS_W).cast::<f32>().read_unaligned() };
+        (width - self.read_f32(CTX_SPACING_X) * (cells.saturating_sub(1)) as f32).max(0.0)
+    }
+
+    fn text_colour(&self) -> u32 {
+        unsafe {
+            (self.ctx as *const u8)
+                .add(CTX_TEXT_COLOUR)
+                .cast::<u32>()
+                .read_unaligned()
+        }
+    }
+
+    fn label_aligned(&self, text: &str, align: i32) {
+        let t = cstr(text);
+        Self::call("DrawLabel", || unsafe {
+            (self.nk.label)(self.ctx, t.as_ptr().cast(), align)
+        })
+    }
+
     fn call<R: Default>(what: &str, f: impl FnOnce() -> R) -> R {
         match guarded(f) {
             Ok(r) => r,
@@ -353,20 +441,83 @@ impl Widgets for GameWidgets<'_> {
     fn disable_end(&self) {
         Self::call("DisableEnd", || unsafe { (self.nk.disable_end)(self.ctx) })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Game,
-    Plugins,
+    fn text_width(&self, text: &str) -> f32 {
+        Self::call("CountWrappedLines", || self.nk.text_width(text))
+    }
+    fn text_lines(&self, text: &str, width: f32) -> i32 {
+        let t = cstr(text);
+        Self::call("CountWrappedLines", || unsafe {
+            (self.nk.count_lines)(self.ctx, t.as_ptr().cast(), (t.len() - 1) as i32, width)
+        })
+    }
+    fn line_height(&self) -> f32 {
+        let font = unsafe {
+            (self.ctx as *const u8)
+                .add(CTX_FONT)
+                .cast::<*const u8>()
+                .read_unaligned()
+        };
+        let h = if font.is_null() {
+            0.0
+        } else {
+            unsafe { font.add(USER_FONT_HEIGHT).cast::<f32>().read_unaligned() }
+        };
+        if h > 1.0 && h < 500.0 { h } else { crate::ui::ROW_H }
+    }
+    fn row_width(&self) -> f32 {
+        self.usable(3) * (1.0 - 2.0 * self.inset())
+    }
+    fn row_cells(&self, height: f32, widths: &[f32]) {
+        if widths.is_empty() || widths.len() > 8 {
+            return self.row(height, widths.len() as i32);
+        }
+        // An empty cell on each side is the margin; fixed cells take their width, and cells of
+        // width 0 share what is left.
+        let cells = widths.len() + 2;
+        let usable = self.usable(cells);
+        if usable <= 0.0 {
+            return self.row(height, widths.len() as i32);
+        }
+        let inset = self.inset();
+        let inner = usable * (1.0 - 2.0 * inset);
+        let fixed: f32 = widths.iter().sum();
+        let fillers = widths.iter().filter(|&&w| w <= 0.0).count().max(1) as f32;
+        let spare = ((inner - fixed) / fillers).max(0.0);
+        let mut ratios = Vec::with_capacity(cells);
+        ratios.push(inset);
+        for &w in widths {
+            ratios.push(if w <= 0.0 { spare } else { w } / usable);
+        }
+        ratios.push(inset);
+        let ratios = ratios.into_boxed_slice();
+        let ptr = ratios.as_ptr();
+        self.ratios.borrow_mut().push(ratios);
+        Self::call("LayoutRowRatios", || unsafe {
+            (self.nk.row_ratios)(self.ctx, 0, height, cells as i32, ptr);
+            (self.nk.spacing)(self.ctx);
+        })
+    }
+    fn label_coloured(&self, text: &str, colour: u32) {
+        let at = unsafe { (self.ctx as *mut u8).add(CTX_TEXT_COLOUR).cast::<u32>() };
+        let before = unsafe { at.read_unaligned() };
+        unsafe { at.write_unaligned(colour) };
+        self.label(text);
+        unsafe { at.write_unaligned(before) };
+    }
+    fn label_right(&self, text: &str) {
+        self.label_aligned(text, ALIGN_RIGHT);
+    }
+    fn label_wrapped(&self, text: &str) {
+        let t = cstr(text);
+        let colour = self.text_colour();
+        Self::call("DrawWrappedLabel", || unsafe {
+            (self.nk.wrapped_label)(self.ctx, t.as_ptr().cast(), colour)
+        })
+    }
 }
 
 thread_local! {
-    static MODE: Cell<Mode> = const { Cell::new(Mode::Game) };
-    static LAST_BUILD_MS: Cell<u64> = const { Cell::new(0) };
     static PAUSE_MS: Cell<u64> = const { Cell::new(0) };
-    /// Set while the plugin screen replaces the pause menu's options (the game is visible behind).
-    static IN_GAME: Cell<bool> = const { Cell::new(false) };
 }
 
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
@@ -415,166 +566,25 @@ unsafe extern "C" fn detour(variant: i32) {
     let original: BuildOptionsMenuScreenFn =
         unsafe { core::mem::transmute(ORIGINAL.load(Ordering::Acquire)) };
     let now = crate::chat::now_ms();
-    let fresh = LAST_BUILD_MS.with(|t| now.saturating_sub(t.replace(now)) > REENTRY_GAP_MS);
-    if fresh {
-        MODE.with(|m| m.set(Mode::Game));
-    }
     // The game may build the main-menu variant (0) behind the pause menu's (1) in the same frame;
-    // only the visible one gets the button or the plugin screen, or both would draw on top of each
-    // other.
+    // only the visible one gets the settings screen, or both would draw on top of each other.
     if variant == 1 {
         PAUSE_MS.with(|t| t.set(now));
     }
     let shadowed = variant == 0 && now.saturating_sub(PAUSE_MS.with(|t| t.get())) < REENTRY_GAP_MS;
-    // Only the main-menu (0) and pause-menu (1) options screens get the button.
-    let ours =
-        (variant == 0 || variant == 1) && !shadowed && MODE.with(|m| m.get()) == Mode::Plugins;
-    if !ours {
-        unsafe { original(variant) };
-        if (variant == 0 || variant == 1) && !shadowed {
-            if let Err(fault) = guarded(|| crate::session::with_nk(draw_button)) {
-                crate::session::host_fault("options button", &fault);
-            }
+    if (variant == 0 || variant == 1) && !shadowed {
+        let mut drawn = false;
+        if let Err(fault) = guarded(|| drawn = crate::session::draw_settings_screen(variant)) {
+            crate::session::host_fault("settings screen", &fault);
         }
-        return;
-    }
-    IN_GAME.with(|g| g.set(variant == 1));
-    if let Err(fault) = guarded(|| crate::session::with_nk(draw_screen)) {
-        crate::session::host_fault("plugin screen", &fault);
-        // Do not leave the user on a screen that cannot draw.
-        MODE.with(|m| m.set(Mode::Game));
-    }
-}
-
-/// The "Plugins" button in the top-right corner, over the game's own options screen.
-fn draw_button(nk: &Nk) {
-    let ctx = nk.ctx();
-    if ctx.is_null() {
-        return;
-    }
-    let width = unsafe { (nk.ui_width)() };
-    let x = width - BUTTON_W - 40.0;
-    let name = c"w2rpm_button";
-    // The window is only a carrier for the game's menu button: under the game's current skin it
-    // paints a plank of its own behind the button (a double paint), so use the near-clear panel.
-    let prev_skin = nk.push_skin(unsafe { *nk.skin_content });
-    unsafe {
-        if (nk.begin_window)(
-            ctx,
-            name.as_ptr(),
-            x,
-            40.0,
-            BUTTON_W,
-            BUTTON_H,
-            WINDOW_NO_SCROLLBAR,
-        ) != 0
-        {
-            (nk.row)(ctx, BUTTON_H - 20.0, 1);
-            let w = GameWidgets {
-                nk,
-                ctx,
-                in_card: Cell::new(false),
-            };
-            if w.button("Plugins") {
-                MODE.with(|m| m.set(Mode::Plugins));
-            }
-        }
-        (nk.end_window)(ctx);
-    }
-    nk.push_skin(prev_skin);
-}
-
-/// The plugin screen in place of the game's options screen.
-fn draw_screen(nk: &Nk) {
-    let ctx = nk.ctx();
-    if ctx.is_null() {
-        return;
-    }
-    let width = unsafe { (nk.ui_width)() }.floor();
-    let panel_w = (width * PANEL_WIDTH_PERCENT / 100.0).floor();
-    let panel_x = ((width - panel_w) / 2.0).floor();
-    let in_game = IN_GAME.with(|g| g.get());
-    // In game the screen is the pause menu's popup, with the game's own rectangle and skin; on
-    // the main menu it fills the screen. `title`/`list` are window-relative.
-    let (window, title_r, list_r) = if in_game {
-        let mut r = [0.0f32; 4];
-        unsafe { (nk.popup_layout)(&mut r, 1.0) };
-        (
-            r,
-            [
-                POPUP_MARGIN,
-                POPUP_MARGIN,
-                r[2] - 2.0 * POPUP_MARGIN,
-                TITLE_HEIGHT,
-            ],
-            [
-                POPUP_MARGIN,
-                POPUP_MARGIN + TITLE_HEIGHT + POPUP_MARGIN / 2.0,
-                r[2] - 2.0 * POPUP_MARGIN,
-                r[3] - TITLE_HEIGHT - 2.5 * POPUP_MARGIN,
-            ],
-        )
-    } else {
-        (
-            [0.0, 0.0, width, UI_HEIGHT],
-            [panel_x, TITLE_TOP, panel_w, TITLE_HEIGHT],
-            [panel_x, PANEL_TOP, panel_w, PANEL_HEIGHT],
-        )
-    };
-    let skin = if in_game {
-        nk.pause_skin()
-    } else {
-        nk.window_skin()
-    };
-    let prev_skin = nk.push_skin(skin);
-    let name = c"w2rpm_plugins";
-    unsafe {
-        if (nk.begin_window)(
-            ctx,
-            name.as_ptr(),
-            window[0],
-            window[1],
-            window[2],
-            window[3],
-            WINDOW_NO_SCROLLBAR,
-        ) == 0
-        {
-            (nk.end_window)(ctx);
-            nk.push_skin(prev_skin);
+        if drawn {
+            crate::settingsscreen::finish(variant);
             return;
         }
-        (nk.space_begin)(ctx, 1, 0.0, 1000);
-        (nk.rect)(ctx, title_r[0], title_r[1], title_r[2], title_r[3]);
-        let title = c"W2R Mod Loader";
-        (nk.label)(ctx, title.as_ptr(), ALIGN_TITLE);
-
-        (nk.rect)(ctx, list_r[0], list_r[1], list_r[2], list_r[3]);
-        let prev_content = if in_game {
-            nk.push_skin(skin)
-        } else {
-            nk.push_skin(*nk.skin_content)
-        };
-        let group = c"w2rpm_plugins_list";
-        let gap_at = (ctx as *mut u8).add(CTX_SPACING_Y).cast::<f32>();
-        let gap_before = gap_at.read_unaligned();
-        gap_at.write_unaligned(ROW_GAP);
-        if (nk.begin_group)(ctx, group.as_ptr(), GROUP_PLAIN) != 0 {
-            let w = GameWidgets {
-                nk,
-                ctx,
-                in_card: Cell::new(false),
-            };
-            if crate::session::draw_plugin_screen(&w) == crate::ui::Action::Back {
-                MODE.with(|m| m.set(Mode::Game));
-            }
-            (nk.end_group)(ctx);
-        }
-        gap_at.write_unaligned(gap_before);
-        nk.push_skin(prev_content);
-        (nk.space_end)(ctx);
-        (nk.end_window)(ctx);
     }
-    nk.push_skin(prev_skin);
+    // Any other variant, a shadowed one, or no screen (symbols missing, no session yet): the
+    // game's own, so there is always a working options screen.
+    unsafe { original(variant) };
 }
 
 const MAIN_MENU_SYMBOL: &str = "MainMenuScreen";
@@ -628,15 +638,62 @@ pub fn install_main_menu(image: &Image, symbols: &Symbols, log: &dyn Log) -> boo
     }
 }
 
+/// The plugin manager popup is open.
+static MANAGER_OPEN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MAIN_MENU_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+const MANAGE_W: f32 = 300.0;
+const MANAGE_GAP: f32 = 40.0;
+const MANAGER_W: f32 = 2500.0;
+const MANAGER_H: f32 = 1900.0;
+const MANAGER_PAD_X: f32 = 100.0;
+const MANAGER_PAD_Y: f32 = 90.0;
+/// Room between the list's panel art and the list inside it.
+const LIST_PAD_X: f32 = 50.0;
+const LIST_PAD_TOP: f32 = 60.0;
+const LIST_PAD_BOTTOM: f32 = 50.0;
+const MANAGER_GAP: f32 = 40.0;
+const CLOSE_W: f32 = 380.0;
+const CLOSE_H: f32 = 120.0;
+/// Dims the main menu behind the popup.
+const MANAGER_SHADE: u32 = 0x6000_0000;
+/// The popup's own background, as the in-match settings screen draws its backdrop: a gold border
+/// around a dark, nearly opaque panel.
+const MANAGER_FILL: u32 = 0xf60e_141a;
+const MANAGER_BORDER: u32 = 0xff30_6078;
+const MANAGER_BORDER_W: f32 = 5.0;
+/// Lightens the Manage button under the mouse.
+const MANAGE_HOVER: u32 = 0x28ff_ffff;
+const UI_HEIGHT: f32 = 2160.0;
+
 unsafe extern "C" fn main_menu_detour() {
     let original: unsafe extern "C" fn() =
         unsafe { core::mem::transmute(MAIN_MENU_ORIGINAL.load(Ordering::Acquire)) };
-    unsafe { original() };
+    // A new visit to the main menu starts with the popup closed.
+    let now = crate::chat::now_ms();
+    if now.saturating_sub(MAIN_MENU_MS.with(|t| t.replace(now))) > REENTRY_GAP_MS {
+        MANAGER_OPEN.store(false, Ordering::Release);
+    }
+    // While the plugin manager is open the game's menu is not built, so nothing behind the popup
+    // can be clicked; it is built afresh once the popup closes.
+    if !MANAGER_OPEN.load(Ordering::Acquire) {
+        unsafe { original() };
+    }
     if let Err(fault) = guarded(|| crate::session::with_nk(draw_version)) {
         crate::session::host_fault("title screen version", &fault);
     }
+    if MANAGER_OPEN.load(Ordering::Acquire) {
+        if let Err(fault) = guarded(|| crate::session::with_nk(draw_manager)) {
+            crate::session::host_fault("plugin manager", &fault);
+            MANAGER_OPEN.store(false, Ordering::Release);
+        }
+    }
 }
 
+/// The version lines in the title screen's top-left corner, with a Manage button after the
+/// plugin count.
 fn draw_version(nk: &Nk) {
     let ctx = nk.ctx();
     if ctx.is_null() {
@@ -650,8 +707,13 @@ fn draw_version(nk: &Nk) {
         }
         _ => format!("W2R Mod Loader {}", env!("CARGO_PKG_VERSION")),
     };
-    let lines = [Some(version), crate::session::plugin_summary()];
+    let summary = crate::session::plugin_summary();
+    let lines = [Some(version), summary.clone()];
+    let open = MANAGER_OPEN.load(Ordering::Acquire);
     unsafe {
+        // Kept behind the game's own windows and taking no input, so it never takes focus from
+        // the menu (a background window that is clicked turns read-only). The Manage button
+        // reads the mouse itself.
         if (nk.begin_window)(
             ctx,
             name.as_ptr(),
@@ -668,8 +730,127 @@ fn draw_version(nk: &Nk) {
                 (nk.rect)(ctx, VERSION_X, VERSION_H * i as f32, VERSION_W, VERSION_H);
                 (nk.label)(ctx, text.as_ptr().cast(), ALIGN_ROW);
             }
+            if let (Some(summary), false) = (&summary, open) {
+                let x = VERSION_X + nk.text_width(summary) + MANAGE_GAP;
+                (nk.rect)(ctx, x, VERSION_H + 10.0, MANAGE_W, VERSION_H - 20.0);
+                // Where the button lands on screen.
+                let mut b = [0f32; 4];
+                (nk.widget_space)(b.as_mut_ptr(), ctx, core::ptr::null_mut(), 0);
+                let label = cstr("Manage");
+                (nk.button)(ctx, label.as_ptr().cast());
+                let read = |offset: usize| (ctx as *const u8).add(offset);
+                let mx = read(CTX_MOUSE_X).cast::<f32>().read_unaligned();
+                let my = read(CTX_MOUSE_Y).cast::<f32>().read_unaligned();
+                let hovered = mx >= b[0] && mx < b[0] + b[2] && my >= b[1] && my < b[1] + b[3];
+                if hovered {
+                    let win = read(CTX_CURRENT_WINDOW).cast::<*mut u8>().read_unaligned();
+                    if !win.is_null() {
+                        let canvas = win.add(WINDOW_BUFFER).cast::<c_void>();
+                        (nk.fill_rect)(canvas, b[0], b[1], b[2], b[3], 0.0, MANAGE_HOVER);
+                    }
+                    let down = read(CTX_MOUSE_LEFT_DOWN).cast::<i32>().read_unaligned() != 0;
+                    let clicked = read(CTX_MOUSE_LEFT_CLICKED).cast::<u32>().read_unaligned() != 0;
+                    if down && clicked {
+                        MANAGER_OPEN.store(true, Ordering::Release);
+                    }
+                }
+            }
             (nk.space_end)(ctx);
         }
         (nk.end_window)(ctx);
     }
+}
+
+/// The plugin manager: a window of its own over the whole title screen, dimming it, with the
+/// plugin list in a popup frame and a Close button.
+fn draw_manager(nk: &Nk) {
+    let ctx = nk.ctx();
+    if ctx.is_null() {
+        return;
+    }
+    let ui_w = unsafe { (nk.ui_width)() }.floor();
+    let frame = [
+        ((ui_w - MANAGER_W) * 0.5).floor(),
+        ((UI_HEIGHT - MANAGER_H) * 0.5).floor(),
+        MANAGER_W,
+        MANAGER_H,
+    ];
+    let x = frame[0] + MANAGER_PAD_X;
+    let y = frame[1] + MANAGER_PAD_Y;
+    let w = MANAGER_W - MANAGER_PAD_X * 2.0;
+    let h = MANAGER_H - MANAGER_PAD_Y * 2.0;
+    let list_top = y + crate::ui::ROW_H + MANAGER_GAP;
+    let close_y = y + h - CLOSE_H;
+    let list_h = close_y - MANAGER_GAP - list_top;
+
+    let prev_skin = nk.push_skin(nk.window_skin());
+    unsafe {
+        let opened = (nk.begin_window)(
+            ctx,
+            c"w2r_plugin_manager".as_ptr(),
+            0.0,
+            0.0,
+            ui_w,
+            UI_HEIGHT,
+            WINDOW_NO_SCROLLBAR,
+        ) != 0;
+        if opened {
+            (nk.space_begin)(ctx, 1, 0.0, 1000);
+            let win = (ctx as *const u8)
+                .add(CTX_CURRENT_WINDOW)
+                .cast::<*mut u8>()
+                .read_unaligned();
+            if !win.is_null() {
+                let canvas = win.add(WINDOW_BUFFER).cast::<c_void>();
+                (nk.fill_rect)(canvas, 0.0, 0.0, ui_w, UI_HEIGHT, 0.0, MANAGER_SHADE);
+                let [fx, fy, fw, fh] = frame;
+                let b = MANAGER_BORDER_W;
+                (nk.fill_rect)(canvas, fx, fy, fw, fh, 0.0, MANAGER_BORDER);
+                (nk.fill_rect)(canvas, fx + b, fy + b, fw - b * 2.0, fh - b * 2.0, 0.0, MANAGER_FILL);
+            }
+
+            (nk.rect)(ctx, x, y, w, crate::ui::ROW_H);
+            let title = cstr("Plugins");
+            (nk.label)(ctx, title.as_ptr().cast(), ALIGN_TITLE);
+
+            // The list scrolls in a group inset inside a content panel, so it does not touch the
+            // panel's frame.
+            (nk.rect)(ctx, x, list_top, w, list_h);
+            let prev = nk.push_skin(*nk.skin_content);
+            let framed =
+                (nk.begin_group)(ctx, c"w2r_plugin_manager_frame".as_ptr(), WINDOW_NO_SCROLLBAR)
+                    != 0;
+            nk.push_skin(prev);
+            if framed {
+                (nk.space_begin)(ctx, 1, 0.0, 1000);
+                (nk.rect)(
+                    ctx,
+                    LIST_PAD_X,
+                    LIST_PAD_TOP,
+                    w - LIST_PAD_X * 2.0,
+                    list_h - LIST_PAD_TOP - LIST_PAD_BOTTOM,
+                );
+                if (nk.begin_group)(ctx, c"w2r_plugin_manager_list".as_ptr(), 0) != 0 {
+                    let gap_at = (ctx as *mut u8).add(CTX_SPACING_Y).cast::<f32>();
+                    let gap_before = gap_at.read_unaligned();
+                    gap_at.write_unaligned(crate::ui::ROW_GAP);
+                    let widgets = GameWidgets::new(nk, ctx);
+                    crate::session::draw_plugin_list(&widgets);
+                    gap_at.write_unaligned(gap_before);
+                    (nk.end_group)(ctx);
+                }
+                (nk.space_end)(ctx);
+                (nk.end_group)(ctx);
+            }
+
+            (nk.rect)(ctx, x + (w - CLOSE_W) * 0.5, close_y, CLOSE_W, CLOSE_H);
+            let close = cstr("Close");
+            if (nk.button)(ctx, close.as_ptr().cast()) != 0 {
+                MANAGER_OPEN.store(false, Ordering::Release);
+            }
+            (nk.space_end)(ctx);
+        }
+        (nk.end_window)(ctx);
+    }
+    nk.push_skin(prev_skin);
 }
