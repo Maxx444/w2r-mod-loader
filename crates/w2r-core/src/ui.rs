@@ -18,6 +18,10 @@ pub const ROW_H: f32 = 90.0;
 pub const ROW_GAP: f32 = 24.0;
 /// What a plugin's card needs beyond its rows: the frame's own padding, top and bottom.
 pub const CARD_PAD: f32 = 20.0;
+/// Room below a card's last row, under which the frame's bottom border sits. The measured rows
+/// come out a little short of what the game draws (a wrapped label's lines are spaced wider than
+/// the font's line height), so without it the last line touches the border.
+pub const CARD_BOTTOM: f32 = 90.0;
 /// The empty row at the top of a card, under the frame's border.
 pub const CARD_TOP_H: f32 = 70.0;
 /// An edit row. The game's edit box pads its text, and the plugin screen's font is 80 high, so a
@@ -591,7 +595,7 @@ pub fn draw_plugin_list(
             draw_section(&m, i);
         }
         w.card_end();
-        let needed = m.height.get() + CARD_PAD;
+        let needed = m.height.get() + CARD_PAD + CARD_BOTTOM;
         CARD_HEIGHTS.with(|h| h.borrow_mut().insert(row.id.clone(), needed));
     }
     action
