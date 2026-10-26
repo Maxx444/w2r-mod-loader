@@ -259,8 +259,9 @@ mod cb {
             let (Some(f), Some(t)) = (unsafe { frame(ctx) }, unsafe { self::text(text) }) else {
                 return 0;
             };
-            f.widgets.row(ROW_H, 1);
-            f.widgets.label(t);
+            // Wraps onto as many lines as it needs, as the card's description does, instead of
+            // being cut at the card's edge.
+            super::paragraph(f.widgets, t);
             0
         });
     }
@@ -902,6 +903,49 @@ mod tests {
                 0
             );
         });
+    }
+
+    #[test]
+    fn a_label_is_a_row_as_tall_as_its_wrapped_lines() {
+        struct Narrow(FakeWidgets);
+        impl Widgets for Narrow {
+            fn row(&self, height: f32, cols: i32) {
+                self.0.row(height, cols)
+            }
+            fn label(&self, text: &str) {
+                self.0.label(text)
+            }
+            fn button(&self, text: &str) -> bool {
+                self.0.button(text)
+            }
+            fn checkbox(&self, text: &str, value: &mut bool) -> bool {
+                self.0.checkbox(text, value)
+            }
+            fn slider(&self, text: &str, value: &mut i32, min: i32, max: i32) -> bool {
+                self.0.slider(text, value, min, max)
+            }
+            fn text_lines(&self, text: &str, _width: f32) -> i32 {
+                if text.len() > 20 { 3 } else { 1 }
+            }
+            fn label_wrapped(&self, text: &str) {
+                self.0.calls.borrow_mut().push(format!("wrapped {text:?}"));
+            }
+        }
+        let w = Narrow(FakeWidgets::default());
+        with_frame(&w, |ui| unsafe {
+            (ui.label)(ui.ctx, s("short"));
+            (ui.label)(ui.ctx, s("a much longer line that wraps"));
+        });
+        let calls = w.0.calls.borrow();
+        assert_eq!(
+            *calls,
+            [
+                format!("row {} 1", ROW_H),
+                "wrapped \"short\"".to_string(),
+                format!("row {} 1", 3.0 * ROW_H),
+                "wrapped \"a much longer line that wraps\"".to_string(),
+            ]
+        );
     }
 
     #[test]
