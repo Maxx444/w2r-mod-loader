@@ -768,6 +768,8 @@ fn draw_manager(nk: &Nk) {
     if ctx.is_null() {
         return;
     }
+    // Ctrl+C / X / V / A in the cards' text boxes.
+    crate::menukeys::feed(ctx);
     let ui_w = unsafe { (nk.ui_width)() }.floor();
     let frame = [
         ((ui_w - MANAGER_W) * 0.5).floor(),
