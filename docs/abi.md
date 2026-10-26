@@ -99,6 +99,16 @@ plugin falls back to `text_edit`):
   by the plugin and its caption, so captions of color rows should differ. While the editor is open
   the plugin manager behind it is read-only; opening the manager again closes an editor left open.
 
+And one after `color_edit` (`ui->struct_size >= W2R_UI_COMBO_SIZE`):
+
+- `combo(ctx, text, choices, count, selected)`: a dropdown row like the options screen's: the
+  caption, then a dropdown showing `choices[*selected]`, the game's own dropdown widget. `count` is
+  2 to `W2R_MAX_SETTING_CHOICE_COUNT` (16) and each choice at most `W2R_MAX_SETTING_CHOICE` (64)
+  bytes; otherwise, or with a null pointer, a no-op that reports 0. Unlike a declared dropdown the
+  list is the plugin's to change every frame. A `*selected` out of range shows the last entry. The
+  call returns 1 on the frame the player picked a different entry, with `*selected` set to it.
+  The open dropdown's rows shrink to fit, as on the options screen.
+
 ## Declared settings
 
 Appended after `create_map_folder` (`host->struct_size >= W2R_HOST_SETTINGS_DECLARE_SIZE`; an

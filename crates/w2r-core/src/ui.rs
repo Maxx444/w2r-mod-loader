@@ -48,6 +48,11 @@ pub trait Widgets {
     fn color_edit(&self, _key: &str, _text: &str, _hex: &mut [u8; 6]) -> bool {
         false
     }
+    /// A dropdown row: `text` and a dropdown of `choices` showing `*selected` (in range). `key`
+    /// names the row across frames. True on the frame the player picked a different entry.
+    fn combo(&self, _key: &str, _text: &str, _choices: &[&str], _selected: &mut usize) -> bool {
+        false
+    }
     /// Greys out everything until `disable_end`.
     fn disable_begin(&self) {}
     fn disable_end(&self) {}
@@ -120,6 +125,9 @@ impl Widgets for Measured<'_> {
     }
     fn color_edit(&self, key: &str, text: &str, hex: &mut [u8; 6]) -> bool {
         self.inner.color_edit(key, text, hex)
+    }
+    fn combo(&self, key: &str, text: &str, choices: &[&str], selected: &mut usize) -> bool {
+        self.inner.combo(key, text, choices, selected)
     }
     fn disable_begin(&self) {
         self.inner.disable_begin();
@@ -210,6 +218,7 @@ pub fn with_owned_frame<R>(widgets: &dyn Widgets, owner: &str, f: impl FnOnce(&W
         text_edit: cb::text_edit,
         set_active: cb::set_active,
         color_edit: cb::color_edit,
+        combo: cb::combo,
     };
     let result = f(&table);
     if frame.dimmed.get() {
@@ -379,7 +388,49 @@ mod cb {
             }
         })
     }
+
+    pub unsafe extern "C" fn combo(
+        ctx: *mut c_void,
+        text: W2rStr,
+        choices: *const W2rStr,
+        count: u32,
+        selected: *mut i32,
+    ) -> i32 {
+        run(|| {
+            let (Some(f), Some(t)) = (unsafe { frame(ctx) }, unsafe { self::text(text) }) else {
+                return 0;
+            };
+            let n = count as usize;
+            if choices.is_null() || selected.is_null() || !(2..=MAX_COMBO_CHOICES).contains(&n) {
+                return 0;
+            }
+            // SAFETY: the plugin gives `count` strings; each is checked like any other text.
+            let raw = unsafe { core::slice::from_raw_parts(choices, n) };
+            let mut list = Vec::with_capacity(n);
+            for s in raw {
+                match unsafe { self::text(*s) } {
+                    Some(c) if c.len() <= MAX_COMBO_CHOICE => list.push(c),
+                    _ => return 0,
+                }
+            }
+            let mut sel = usize::try_from(unsafe { *selected })
+                .unwrap_or(0)
+                .min(n - 1);
+            f.widgets.row(ROW_H, 2);
+            let key = format!("{}\u{1f}{t}", f.owner);
+            if f.widgets.combo(&key, t, &list, &mut sel) && sel < n {
+                unsafe { *selected = sel as i32 };
+                1
+            } else {
+                0
+            }
+        })
+    }
 }
+
+/// The most entries a card dropdown takes, and the longest entry (as declared dropdowns).
+pub const MAX_COMBO_CHOICES: usize = w2r_abi::W2R_MAX_SETTING_CHOICE_COUNT as usize;
+pub const MAX_COMBO_CHOICE: usize = w2r_abi::W2R_MAX_SETTING_CHOICE as usize;
 
 /// `bytes` as six lowercase hex digits, or None.
 fn hex_digits(bytes: &[u8]) -> Option<[u8; 6]> {
@@ -592,6 +643,20 @@ pub mod fake {
             }
             hex.copy_from_slice(new.as_bytes());
             true
+        }
+        fn combo(&self, key: &str, text: &str, choices: &[&str], selected: &mut usize) -> bool {
+            self.calls.borrow_mut().push(format!(
+                "combo {key:?} {text:?} {choices:?} {}",
+                choices[*selected]
+            ));
+            // `set` holds the entry the user picks in the dropdown with this caption.
+            match self.set.borrow().get(text) {
+                Some(&v) if v as usize != *selected => {
+                    *selected = v as usize;
+                    true
+                }
+                _ => false,
+            }
         }
         fn disable_begin(&self) {
             self.calls.borrow_mut().push("disable_begin".into());
@@ -880,11 +945,76 @@ mod tests {
     }
 
     #[test]
+    fn combo_shows_the_choices_and_reports_a_pick() {
+        let fake = FakeWidgets::default();
+        fake.set.borrow_mut().insert("Color Profile".into(), 3);
+        let names = ["Custom", "Game default", "Remastered", "Classic"];
+        let strs: Vec<W2rStr> = names.iter().map(|n| s(n)).collect();
+        let mut picked = 1i32;
+        let mut other = 0i32;
+        with_owned_frame(&fake, "w2r-unit-color", |ui| unsafe {
+            assert_eq!(
+                (ui.combo)(ui.ctx, s("Color Profile"), strs.as_ptr(), 4, &mut picked),
+                1
+            );
+            assert_eq!(
+                (ui.combo)(ui.ctx, s("Other"), strs.as_ptr(), 4, &mut other),
+                0
+            );
+        });
+        assert_eq!(picked, 3);
+        assert_eq!(other, 0);
+        let calls = fake.calls.borrow();
+        assert!(calls.iter().any(|c| {
+            c.starts_with("combo \"w2r-unit-color\\u{1f}Color Profile\" \"Color Profile\"")
+                && c.ends_with(" Game default")
+        }));
+        assert_eq!(calls.iter().filter(|c| c.starts_with("row ")).count(), 2);
+    }
+
+    #[test]
+    fn combo_refuses_bad_lists_and_clamps_the_selection() {
+        let fake = FakeWidgets::default();
+        let one = [s("Only")];
+        let long = "x".repeat(MAX_COMBO_CHOICE + 1);
+        let bad = [s("A"), s(&long)];
+        let many: Vec<W2rStr> = (0..=MAX_COMBO_CHOICES).map(|_| s("A")).collect();
+        let fine = [s("A"), s("B")];
+        let mut sel = 9i32;
+        with_frame(&fake, |ui| unsafe {
+            assert_eq!((ui.combo)(ui.ctx, s("C"), one.as_ptr(), 1, &mut sel), 0);
+            assert_eq!((ui.combo)(ui.ctx, s("C"), bad.as_ptr(), 2, &mut sel), 0);
+            let n = many.len() as u32;
+            assert_eq!((ui.combo)(ui.ctx, s("C"), many.as_ptr(), n, &mut sel), 0);
+            assert_eq!(
+                (ui.combo)(ui.ctx, s("C"), core::ptr::null(), 2, &mut sel),
+                0
+            );
+            assert_eq!(
+                (ui.combo)(ui.ctx, s("C"), fine.as_ptr(), 2, core::ptr::null_mut()),
+                0
+            );
+            // Out of range shows the last entry and is left alone.
+            assert_eq!((ui.combo)(ui.ctx, s("C"), fine.as_ptr(), 2, &mut sel), 0);
+        });
+        assert_eq!(sel, 9);
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("combo ")).count(), 1);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("combo ") && c.ends_with(" B"))
+        );
+    }
+
+    #[test]
     fn the_table_offers_color_edit() {
         let fake = FakeWidgets::default();
         with_frame(&fake, |ui| {
             assert!(ui.struct_size >= w2r_abi::W2R_UI_COLOR_EDIT_SIZE);
             assert!(w2r_abi::W2R_UI_COLOR_EDIT_SIZE > w2r_abi::W2R_UI_TEXT_EDIT_SIZE);
+            assert!(ui.struct_size >= w2r_abi::W2R_UI_COMBO_SIZE);
+            assert!(w2r_abi::W2R_UI_COMBO_SIZE > w2r_abi::W2R_UI_COLOR_EDIT_SIZE);
         });
     }
 

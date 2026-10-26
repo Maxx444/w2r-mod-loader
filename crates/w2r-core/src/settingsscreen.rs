@@ -1609,6 +1609,71 @@ pub(crate) fn card_swatch(ctx: *mut c_void, hex: &str) -> bool {
     true
 }
 
+thread_local! {
+    /// Whether each card dropdown (by `ui::Widgets::combo`'s key) was open last frame: its header
+    /// is drawn with the open skin, as on the options screen.
+    static CARD_COMBOS: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A plugin card's dropdown in the next cell of the current row, drawn as the options screen's:
+/// the header shows `choices[*selected]`; the popup lists every choice, rows shrunk to fit as on
+/// the options screen (up to 16). True on the frame a different entry was picked; None when the
+/// screen's functions are not available (nothing drawn).
+pub(crate) fn card_combo(
+    ctx: *mut c_void,
+    key: &str,
+    choices: &[&str],
+    selected: &mut usize,
+) -> Option<bool> {
+    let fns = FNS.get()?;
+    if choices.is_empty() {
+        return Some(false);
+    }
+    let current = (*selected).min(choices.len() - 1);
+    let was_open = CARD_COMBOS.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(k, _)| k == key)
+            .is_some_and(|(_, open)| *open)
+    });
+    let width = next_cell(fns, ctx).map_or(600.0, |[_, _, w, _]| w);
+    let (item_h, combo_h) = combo_layout(choices.len());
+    let spacing = read_f32(ctx, CTX_SPACING_Y);
+    let prev = fns.push_skin(fns.combo_skin(was_open));
+    set_row_spacing(ctx, spacing);
+    let header = cstr(choices[current]);
+    let opened =
+        unsafe { (fns.combo_begin)(ctx, header.as_ptr().cast(), ALIGN_ROW, width, combo_h) } != 0;
+    fns.push_skin(prev);
+    set_row_spacing(ctx, spacing);
+    CARD_COMBOS.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = opened,
+            None => m.push((key.to_owned(), opened)),
+        }
+    });
+    let mut changed = false;
+    if opened {
+        // No spacing between the popup's items. Set before the first row.
+        set_row_spacing(ctx, 0.0);
+        for (o, choice) in choices.iter().enumerate() {
+            row(fns, ctx, item_h, 1);
+            let t = cstr(choice);
+            if unsafe { (fns.combo_item)(ctx, t.as_ptr().cast(), ALIGN_ROW) } != 0 {
+                if o != current {
+                    *selected = o;
+                    changed = true;
+                }
+                unsafe { (fns.combo_close)(ctx) };
+            }
+        }
+        unsafe { (fns.combo_end)(ctx) };
+        set_row_spacing(ctx, spacing);
+    }
+    Some(changed)
+}
+
 /// Makes the current window read-only, or not (the plugin manager while a card's editor is open).
 pub(crate) fn set_window_read_only(ctx: *mut c_void, on: bool) {
     set_read_only(ctx, on);
