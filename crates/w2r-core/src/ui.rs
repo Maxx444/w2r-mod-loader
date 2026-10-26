@@ -42,6 +42,12 @@ pub trait Widgets {
     fn text_edit(&self, _text: &str, _buf: &mut [u8]) -> bool {
         false
     }
+    /// A color row: `text`, a swatch of `hex` (`rrggbb`) and a button that opens the color
+    /// editor. `key` names the row across frames (the plugin and the caption). True on the frame
+    /// the editor's OK picked a different color, with `hex` rewritten.
+    fn color_edit(&self, _key: &str, _text: &str, _hex: &mut [u8; 6]) -> bool {
+        false
+    }
     /// Greys out everything until `disable_end`.
     fn disable_begin(&self) {}
     fn disable_end(&self) {}
@@ -112,6 +118,9 @@ impl Widgets for Measured<'_> {
     fn text_edit(&self, text: &str, buf: &mut [u8]) -> bool {
         self.inner.text_edit(text, buf)
     }
+    fn color_edit(&self, key: &str, text: &str, hex: &mut [u8; 6]) -> bool {
+        self.inner.color_edit(key, text, hex)
+    }
     fn disable_begin(&self) {
         self.inner.disable_begin();
     }
@@ -156,6 +165,8 @@ struct Frame<'a> {
     widgets: &'a dyn Widgets,
     /// `set_active(0)` is in effect; closed when the frame ends if the plugin forgot.
     dimmed: Cell<bool>,
+    /// Whose rows these are (the plugin id), so a color row is known again next frame.
+    owner: &'a str,
 }
 
 /// The longest edit buffer a plugin may hand over.
@@ -171,6 +182,11 @@ thread_local! {
 /// Runs `f` with a table over `widgets`. The table is live only inside `f`; the frame behind
 /// it never moves, and the previous active frame (if `f` nests) is restored on the way out.
 pub fn with_frame<R>(widgets: &dyn Widgets, f: impl FnOnce(&W2rUi) -> R) -> R {
+    with_owned_frame(widgets, "", f)
+}
+
+/// [`with_frame`] for the rows of the plugin `owner`.
+pub fn with_owned_frame<R>(widgets: &dyn Widgets, owner: &str, f: impl FnOnce(&W2rUi) -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -180,6 +196,7 @@ pub fn with_frame<R>(widgets: &dyn Widgets, f: impl FnOnce(&W2rUi) -> R) -> R {
     let mut frame = Frame {
         widgets,
         dimmed: Cell::new(false),
+        owner,
     };
     let ctx: *mut Frame<'_> = &mut frame;
     let _restore = Restore(ACTIVE.with(|a| a.replace(ctx as usize)));
@@ -192,6 +209,7 @@ pub fn with_frame<R>(widgets: &dyn Widgets, f: impl FnOnce(&W2rUi) -> R) -> R {
         slider_int: cb::slider_int,
         text_edit: cb::text_edit,
         set_active: cb::set_active,
+        color_edit: cb::color_edit,
     };
     let result = f(&table);
     if frame.dimmed.get() {
@@ -334,6 +352,48 @@ mod cb {
             0
         });
     }
+
+    pub unsafe extern "C" fn color_edit(ctx: *mut c_void, text: W2rStr, hex: *mut u8) -> i32 {
+        run(|| {
+            let (Some(f), Some(t)) = (unsafe { frame(ctx) }, unsafe { self::text(text) }) else {
+                return 0;
+            };
+            if hex.is_null() {
+                return 0;
+            }
+            // SAFETY: the ABI gives the buffer as W2R_COLOR_HEX_BYTES (7) bytes.
+            let buf = unsafe { &mut *hex.cast::<[u8; 7]>() };
+            // Anything but six hex digits shows (and edits) as black.
+            let mut digits = [b'0'; 6];
+            if let Some(rgb) = super::hex_digits(&buf[..6]) {
+                digits = rgb;
+            }
+            f.widgets.row(ROW_H, 3);
+            let key = format!("{}\u{1f}{t}", f.owner);
+            if f.widgets.color_edit(&key, t, &mut digits) {
+                buf[..6].copy_from_slice(&digits);
+                buf[6] = 0;
+                1
+            } else {
+                0
+            }
+        })
+    }
+}
+
+/// `bytes` as six lowercase hex digits, or None.
+fn hex_digits(bytes: &[u8]) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    if bytes.len() < 6 {
+        return None;
+    }
+    for (o, b) in out.iter_mut().zip(bytes) {
+        if !b.is_ascii_hexdigit() {
+            return None;
+        }
+        *o = b.to_ascii_lowercase();
+    }
+    Some(out)
 }
 
 /// A plugin as the manager shows it.
@@ -516,6 +576,21 @@ pub mod fake {
             let n = new.len().min(buf.len() - 1);
             buf[..n].copy_from_slice(&new.as_bytes()[..n]);
             buf[n] = 0;
+            true
+        }
+        fn color_edit(&self, key: &str, text: &str, hex: &mut [u8; 6]) -> bool {
+            self.calls.borrow_mut().push(format!(
+                "color_edit {key:?} {text:?} {}",
+                String::from_utf8_lossy(hex)
+            ));
+            // `typed` holds the color the user picks in the editor for this caption.
+            let Some(new) = self.typed.borrow().get(text).cloned() else {
+                return false;
+            };
+            if new.len() != 6 || new.as_bytes() == hex.as_slice() {
+                return false;
+            }
+            hex.copy_from_slice(new.as_bytes());
             true
         }
         fn disable_begin(&self) {
@@ -761,6 +836,55 @@ mod tests {
                 (ui.text_edit)(ui.ctx, s("Colour"), buf.as_mut_ptr(), MAX_EDIT as u32 + 1),
                 0
             );
+        });
+    }
+
+    #[test]
+    fn color_edit_rewrites_the_plugins_hex_when_a_color_is_picked() {
+        let fake = FakeWidgets::default();
+        fake.typed
+            .borrow_mut()
+            .insert("Player 1 (Red)".into(), "00ff88".into());
+        let mut red = *b"A60000\0";
+        let mut blue = *b"0096ff\0";
+        with_owned_frame(&fake, "w2r-unit-color", |ui| unsafe {
+            assert_eq!(
+                (ui.color_edit)(ui.ctx, s("Player 1 (Red)"), red.as_mut_ptr()),
+                1
+            );
+            assert_eq!(
+                (ui.color_edit)(ui.ctx, s("Player 2 (Blue)"), blue.as_mut_ptr()),
+                0
+            );
+            assert_eq!((ui.color_edit)(ui.ctx, s("X"), core::ptr::null_mut()), 0);
+        });
+        assert_eq!(&red, b"00ff88\0");
+        assert_eq!(&blue, b"0096ff\0");
+        let calls = fake.calls.borrow();
+        // The swatch shows lowercase digits, and the row is known by plugin and caption.
+        assert!(calls.contains(
+            &"color_edit \"w2r-unit-color\\u{1f}Player 1 (Red)\" \"Player 1 (Red)\" a60000".into()
+        ));
+        assert_eq!(calls.iter().filter(|c| c.starts_with("row ")).count(), 2);
+    }
+
+    #[test]
+    fn color_edit_shows_a_bad_buffer_as_black() {
+        let fake = FakeWidgets::default();
+        let mut bad = *b"zz\0\0\0\0\0";
+        with_frame(&fake, |ui| unsafe {
+            assert_eq!((ui.color_edit)(ui.ctx, s("C"), bad.as_mut_ptr()), 0);
+        });
+        assert!(fake.calls.borrow().iter().any(|c| c.ends_with("000000")));
+        assert_eq!(&bad, b"zz\0\0\0\0\0");
+    }
+
+    #[test]
+    fn the_table_offers_color_edit() {
+        let fake = FakeWidgets::default();
+        with_frame(&fake, |ui| {
+            assert!(ui.struct_size >= w2r_abi::W2R_UI_COLOR_EDIT_SIZE);
+            assert!(w2r_abi::W2R_UI_COLOR_EDIT_SIZE > w2r_abi::W2R_UI_TEXT_EDIT_SIZE);
         });
     }
 

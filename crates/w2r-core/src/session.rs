@@ -779,7 +779,7 @@ pub fn draw_plugin_list(w: &dyn Widgets) {
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let action = ui::draw_plugin_list(w, s.fingerprint, &s.simulation, &mut rows, |w, i| {
             if let Some(slot) = plugins.find(&ids[i]) {
-                ui::with_frame(w, |table| plugins.call_on_ui(slot, table));
+                ui::with_owned_frame(w, &ids[i], |table| plugins.call_on_ui(slot, table));
             }
         });
         if let Action::Toggle(i) = action {

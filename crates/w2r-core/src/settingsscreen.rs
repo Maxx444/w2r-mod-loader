@@ -863,9 +863,45 @@ fn draw_screen(
     // Drawn after the screen, so it is on top. Also when it was opened during this frame.
     if screen.color.is_some() {
         let (editor, native, _) = host.parts();
-        draw_color_popup(fns, ctx, ui_w, screen, editor, native);
+        draw_setting_color_popup(fns, ctx, ui_w, screen, editor, native);
     }
     close
+}
+
+/// The color editor for a setting: OK stores the picked color in the setting.
+fn draw_setting_color_popup(
+    fns: &Fns,
+    ctx: *mut c_void,
+    ui_w: f32,
+    screen: &mut Screen,
+    editor: &mut Editor,
+    native: &mut dyn Native,
+) {
+    let Screen { color, picker, .. } = screen;
+    let Some(edit) = color.as_mut() else {
+        return;
+    };
+    let d = editor.registry.def(edit.index).clone();
+    let title = fns.localize(&d.label);
+    let picked = draw_color_popup(
+        fns,
+        ctx,
+        ui_w,
+        c"w2r_settings_color",
+        edit,
+        picker,
+        &title,
+        Some(&d.default_str),
+    );
+    match picked {
+        Picked::Open => {}
+        Picked::Ok(hex) => {
+            let index = edit.index;
+            editor.set(index, Value::Str(hex), native);
+            *color = None;
+        }
+        Picked::Cancel => *color = None,
+    }
 }
 
 /// Builds the monitor dropdown from the game's display count. Done on each entry, because the
@@ -1161,23 +1197,36 @@ fn set_read_only(ctx: *mut c_void, on: bool) {
     }
 }
 
-/// The color popup: a window of its own over the whole screen, dimming it, with the picker in a
-/// popup frame in the middle. A saturation / brightness square, a hue strip beside it, the new
-/// and the current color, a hex box, and OK / Cancel. Falls back to three sliders if the game
-/// cannot make the textures. The screen behind it is read-only while it is open.
+/// What the color editor's buttons did this frame.
+enum Picked {
+    /// Still open.
+    Open,
+    /// OK: the picked color, six lowercase hex digits.
+    Ok(String),
+    Cancel,
+}
+
+/// The color popup: a window of its own (`window`) over the whole screen, dimming it, with the
+/// picker in a popup frame in the middle. A saturation / brightness square, a hue strip beside it,
+/// the new and the current color, a hex box, Reset to Default (when there is a `default`), and
+/// OK / Cancel. Falls back to three sliders if the game cannot make the textures. The screen
+/// behind it is read-only while it is open. Used by the options screen and by plugin cards.
+#[allow(clippy::too_many_arguments)]
 fn draw_color_popup(
     fns: &Fns,
     ctx: *mut c_void,
     ui_w: f32,
-    screen: &mut Screen,
-    editor: &mut Editor,
-    native: &mut dyn Native,
-) {
+    window: &CStr,
+    edit: &mut ColorEdit,
+    picker: &mut Picker,
+    title: &str,
+    default: Option<&str>,
+) -> Picked {
     let prev_skin = fns.push_skin(fns.window_skin());
     let opened = unsafe {
         (fns.begin_window)(
             ctx,
-            c"w2r_settings_color".as_ptr(),
+            window.as_ptr(),
             0.0,
             0.0,
             ui_w,
@@ -1185,15 +1234,17 @@ fn draw_color_popup(
             GROUP_NO_SCROLLBAR,
         )
     } != 0;
+    let mut picked = Picked::Open;
     if opened {
         unsafe { (fns.space_begin)(ctx, 1, 0.0, 1000) };
         fill(ctx, fns, [0.0, 0.0, ui_w, UI_HEIGHT], POPUP_SHADE);
         let layout = PickerLayout::centred(ui_w);
-        draw_color_picker(fns, ctx, screen, editor, native, &layout);
+        picked = draw_color_picker(fns, ctx, edit, picker, title, default, &layout);
         unsafe { (fns.space_end)(ctx) };
     }
     unsafe { (fns.end_window)(ctx) };
     fns.push_skin(prev_skin);
+    picked
 }
 
 type Area = [f32; 4];
@@ -1269,16 +1320,12 @@ fn place(fns: &Fns, ctx: *mut c_void, [x, y, w, h]: Area) {
 fn draw_color_picker(
     fns: &Fns,
     ctx: *mut c_void,
-    screen: &mut Screen,
-    editor: &mut Editor,
-    native: &mut dyn Native,
+    edit: &mut ColorEdit,
+    picker: &mut Picker,
+    title: &str,
+    default: Option<&str>,
     layout: &PickerLayout,
-) {
-    let Some(edit) = screen.color.as_mut() else {
-        return;
-    };
-    let d = editor.registry.def(edit.index).clone();
-
+) -> Picked {
     // The frame the game's own popups use.
     let skin = unsafe {
         if fns.alt() {
@@ -1301,12 +1348,12 @@ fn draw_color_picker(
         unsafe { (fns.end_group)(ctx) };
     }
     place(fns, ctx, layout.title);
-    label(fns, ctx, &fns.localize(&d.label), ALIGN_TITLE);
+    label(fns, ctx, title, ALIGN_TITLE);
 
     let square = layout.square;
     let hue = layout.hue;
     let side = square[2];
-    if ensure_picker_textures(fns, &mut screen.picker) {
+    if ensure_picker_textures(fns, picker) {
         // Dragging: a press inside the square or the strip starts it, releasing ends it.
         let mx = read_f32(ctx, CTX_MOUSE_X);
         let my = read_f32(ctx, CTX_MOUSE_Y);
@@ -1347,21 +1394,15 @@ fn draw_color_picker(
             set_hex_buffer(&mut edit.hex, color::to_rgb(edit.hsv));
         }
 
-        update_square(fns, &mut screen.picker, edit.hsv.h);
+        update_square(fns, picker, edit.hsv.h);
         draw_texture(
             ctx,
             fns,
-            screen.picker.square,
+            picker.square,
             (SQUARE_TEXELS, SQUARE_TEXELS),
             square,
         );
-        draw_texture(
-            ctx,
-            fns,
-            screen.picker.hue,
-            (HUE_TEXEL_WIDTH, HUE_TEXELS),
-            hue,
-        );
+        draw_texture(ctx, fns, picker.hue, (HUE_TEXEL_WIDTH, HUE_TEXELS), hue);
         outline(ctx, fns, square, 2.0, BLACK);
         outline(ctx, fns, hue, 2.0, BLACK);
 
@@ -1449,11 +1490,13 @@ fn draw_color_picker(
         }
     }
 
-    place(fns, ctx, layout.reset);
-    if button(fns, ctx, "Reset to Default") {
-        if let Some(c) = color::parse_hex(&d.default_str) {
-            edit.hsv = color::to_hsv(c);
-            set_hex_buffer(&mut edit.hex, c);
+    if let Some(default) = default {
+        place(fns, ctx, layout.reset);
+        if button(fns, ctx, "Reset to Default") {
+            if let Some(c) = color::parse_hex(default) {
+                edit.hsv = color::to_hsv(c);
+                set_hex_buffer(&mut edit.hex, c);
+            }
         }
     }
 
@@ -1462,13 +1505,156 @@ fn draw_color_picker(
     place(fns, ctx, layout.ok);
     let ok = button(fns, ctx, "OK");
     if ok {
-        let index = edit.index;
-        let picked = color::to_hex(color::to_rgb(edit.hsv));
-        editor.set(index, Value::Str(picked), native);
+        Picked::Ok(color::to_hex(color::to_rgb(edit.hsv)))
+    } else if cancel {
+        Picked::Cancel
+    } else {
+        Picked::Open
     }
-    if ok || cancel {
-        screen.color = None;
+}
+
+// ---- color rows on plugin cards (W2rUi.color_edit) -------------------------------------------
+
+/// The color editor opened from a plugin card's color row, and what its OK picked. Kept apart from
+/// the options screen's, which is a different screen with its own state.
+struct CardColor {
+    /// The row being edited (`ui::Widgets::color_edit`'s key) and the editor's title.
+    open: Option<(String, String, ColorEdit)>,
+    /// OK's color for the row with this key, handed to the row the next time it is drawn.
+    picked: Option<(String, String)>,
+    picker: Picker,
+}
+
+thread_local! {
+    static CARD_COLOR: RefCell<CardColor> = const {
+        RefCell::new(CardColor {
+            open: None,
+            picked: None,
+            picker: Picker {
+                square: 0,
+                hue: 0,
+                square_hue: -1.0,
+                failed: false,
+            },
+        })
+    };
+}
+
+/// Whether a card's color editor is open.
+pub(crate) fn card_color_open() -> bool {
+    CARD_COLOR.with(|c| c.try_borrow().map(|c| c.open.is_some()).unwrap_or(false))
+}
+
+/// Closes a card's color editor without a pick (the plugin manager was opened or closed).
+pub(crate) fn card_color_cancel() {
+    CARD_COLOR.with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            c.open = None;
+            c.picked = None;
+        }
+    });
+}
+
+/// Opens the editor for the row `key`, titled `title`, starting from `hex` (`rrggbb`). False when
+/// the screen's functions are not available.
+pub(crate) fn card_color_start(key: &str, title: &str, hex: &str) -> bool {
+    if FNS.get().is_none() {
+        return false;
     }
+    let original = color::parse_hex(hex).unwrap_or(Rgb { r: 0, g: 0, b: 0 });
+    let mut edit = ColorEdit {
+        index: usize::MAX,
+        hsv: color::to_hsv(original),
+        original,
+        hex: [0; 8],
+        drag: Drag::None,
+    };
+    set_hex_buffer(&mut edit.hex, original);
+    CARD_COLOR.with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            c.open = Some((key.to_owned(), title.to_owned(), edit));
+            c.picked = None;
+        }
+    });
+    true
+}
+
+/// The color OK picked for the row `key`, once.
+pub(crate) fn card_color_take(key: &str) -> Option<String> {
+    CARD_COLOR.with(|c| {
+        let mut c = c.try_borrow_mut().ok()?;
+        if c.picked.as_ref().is_some_and(|(k, _)| k == key) {
+            c.picked.take().map(|(_, hex)| hex)
+        } else {
+            None
+        }
+    })
+}
+
+/// Draws a swatch of `hex` in the next cell of the current row and moves past the cell. False
+/// when the screen's functions are not available (the cell is then left for the caller).
+pub(crate) fn card_swatch(ctx: *mut c_void, hex: &str) -> bool {
+    let Some(fns) = FNS.get() else {
+        return false;
+    };
+    if let Some([x, y, w, h]) = next_cell(fns, ctx) {
+        let rgb = color::parse_hex(hex).unwrap_or(Rgb { r: 0, g: 0, b: 0 });
+        let inset = h * 0.15;
+        let side = (h - inset * 2.0).min(w - SWATCH_ROW_GAP).max(0.0);
+        let swatch = [x + w - side - SWATCH_ROW_GAP, y + inset, side, side];
+        fill(ctx, fns, swatch, color::nk_color(rgb));
+        outline(ctx, fns, swatch, 2.0, BLACK);
+    }
+    unsafe { (fns.skip_cell)(ctx) };
+    true
+}
+
+/// Makes the current window read-only, or not (the plugin manager while a card's editor is open).
+pub(crate) fn set_window_read_only(ctx: *mut c_void, on: bool) {
+    set_read_only(ctx, on);
+}
+
+/// Draws a card's color editor over everything, if one is open. Called after the plugin manager.
+pub(crate) fn draw_card_color_popup() {
+    let Some(fns) = FNS.get().copied() else {
+        return;
+    };
+    let ctx = fns.ctx();
+    if ctx.is_null() {
+        return;
+    }
+    let ui_w = unsafe { (fns.ui_width)() }.floor();
+    CARD_COLOR.with(|c| {
+        let Ok(mut c) = c.try_borrow_mut() else {
+            return;
+        };
+        let CardColor {
+            open,
+            picked,
+            picker,
+        } = &mut *c;
+        let Some((key, title, edit)) = open.as_mut() else {
+            return;
+        };
+        let result = draw_color_popup(
+            &fns,
+            ctx,
+            ui_w,
+            c"w2r_card_color",
+            edit,
+            picker,
+            title,
+            None,
+        );
+        match result {
+            Picked::Open => {}
+            Picked::Ok(hex) => {
+                *picked = Some((key.clone(), hex));
+                *open = None;
+            }
+            Picked::Cancel => *open = None,
+        }
+    });
 }
 
 /// Rows as tall as a text box, which get the wider gap.
