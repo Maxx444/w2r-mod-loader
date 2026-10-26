@@ -104,7 +104,9 @@ const COMBO_POPUP_MAX_HEIGHT: f32 = 1300.0;
 fn combo_layout(n: usize) -> (f32, f32) {
     let n = n.max(1) as f32;
     let fit = (COMBO_POPUP_MAX_HEIGHT - COMBO_POPUP_PAD) / n;
-    let item = fit.clamp(COMBO_ITEM_MIN_HEIGHT, COMBO_ITEM_HEIGHT);
+    // Whole units: a fractional row height puts the seams between rows at uneven positions, so
+    // some gaps between entries look wider than others.
+    let item = fit.floor().clamp(COMBO_ITEM_MIN_HEIGHT, COMBO_ITEM_HEIGHT);
     (item, n * item + COMBO_POPUP_PAD)
 }
 
@@ -1947,6 +1949,10 @@ mod tests {
         assert!(item < COMBO_ITEM_HEIGHT && item >= COMBO_ITEM_MIN_HEIGHT);
         assert!(16.0 * item + COMBO_POPUP_PAD <= COMBO_POPUP_MAX_HEIGHT + 0.01);
         assert_eq!(h, 16.0 * item + COMBO_POPUP_PAD);
+        // Rows are whole units for every length.
+        for n in 1..=16 {
+            assert_eq!(combo_layout(n).0.fract(), 0.0, "{n} entries");
+        }
         // No entries is not a division by zero.
         assert!(combo_layout(0).0.is_finite());
     }
