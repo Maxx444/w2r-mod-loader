@@ -807,6 +807,8 @@ fn draw_manager(nk: &Nk) {
     let close_y = y + h - CLOSE_H;
     let list_h = close_y - MANAGER_GAP - list_top;
 
+    // Ctrl+C / X / V / A in the cards' text boxes and the color editor's hex box.
+    crate::menukeys::feed(ctx);
     // While a card's color editor is open, the manager stays behind it and takes no input.
     let editing = crate::settingsscreen::card_color_open();
     let flags = if editing {

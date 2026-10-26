@@ -670,6 +670,8 @@ pub fn draw(variant: i32, host: &mut dyn ScreenHost) -> bool {
     if ctx.is_null() {
         return true;
     }
+    // Ctrl+C / X / V / A in the screen's text boxes and the color editor's hex box.
+    crate::menukeys::feed(ctx);
     SCREEN.with(|cell| {
         let Ok(mut screen) = cell.try_borrow_mut() else {
             return;
