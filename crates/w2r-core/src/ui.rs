@@ -23,6 +23,9 @@ pub const CARD_TOP_H: f32 = 70.0;
 /// An edit row. The game's edit box pads its text, and the plugin screen's font is 80 high, so a
 /// 90-high row clips the text away and leaves only the caret (seen in game).
 pub const EDIT_ROW_H: f32 = 150.0;
+/// Extra space above an edit row (on top of the row gap), so the box does not sit against the
+/// row before it, such as a dropdown.
+pub const EDIT_GAP: f32 = 12.0;
 /// Room added to a measured text width, so neighbouring cells do not touch.
 pub const CELL_PAD: f32 = 24.0;
 /// The author's name on a plugin card: the game's gold, packed as Nuklear packs colors.
@@ -338,6 +341,8 @@ mod cb {
             if !bytes.contains(&0) {
                 bytes[cap as usize - 1] = 0;
             }
+            f.widgets.row(EDIT_GAP, 1);
+            f.widgets.label("");
             f.widgets.row(EDIT_ROW_H, 2);
             f.widgets.text_edit(t, bytes) as i32
         })
