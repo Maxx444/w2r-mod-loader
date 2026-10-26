@@ -91,8 +91,22 @@ const TITLE_TOP: f32 = 150.0;
 const TITLE_HEIGHT: f32 = 120.0;
 
 const COMBO_ITEM_HEIGHT: f32 = 110.0;
+/// Shortest row a long dropdown's entries shrink to (still well above the font's line height).
+const COMBO_ITEM_MIN_HEIGHT: f32 = 76.0;
 const COMBO_POPUP_PAD: f32 = 40.0;
-const COMBO_POPUP_MAX_HEIGHT: f32 = 900.0;
+/// Tallest dropdown popup. The game's combo popup does not scroll, so a list longer than this
+/// gets shorter rows instead of losing its last entries off the bottom.
+const COMBO_POPUP_MAX_HEIGHT: f32 = 1300.0;
+
+/// Row height and popup height for a dropdown of `n` entries: full-height rows while they fit
+/// under the cap, then rows shrunk (down to `COMBO_ITEM_MIN_HEIGHT`) so every entry shows. Up to
+/// `W2R_MAX_SETTING_CHOICE_COUNT` (16) entries fit without reaching the minimum.
+fn combo_layout(n: usize) -> (f32, f32) {
+    let n = n.max(1) as f32;
+    let fit = (COMBO_POPUP_MAX_HEIGHT - COMBO_POPUP_PAD) / n;
+    let item = fit.clamp(COMBO_ITEM_MIN_HEIGHT, COMBO_ITEM_HEIGHT);
+    (item, n * item + COMBO_POPUP_PAD)
+}
 
 const TIP_MAX_WIDTH: f32 = 1100.0;
 const TIP_PAD: f32 = 26.0;
@@ -1576,15 +1590,14 @@ fn draw_setting_row(
             } else {
                 read_f32(panel, PANEL_BOUNDS_W) * 0.5
             };
-            let combo_h = (d.choices.len() as f32 * COMBO_ITEM_HEIGHT + COMBO_POPUP_PAD)
-                .min(COMBO_POPUP_MAX_HEIGHT);
+            let (item_h, combo_h) = combo_layout(d.choices.len());
             let header = fns.localize(&d.choices[current]);
             if combo_begin(fns, ctx, screen, i, &header, combo_w, combo_h) {
                 // No spacing between the popup's items. Set before the first row.
                 let pane_spacing = read_f32(ctx, CTX_SPACING_Y);
                 set_row_spacing(ctx, 0.0);
                 for (o, choice) in d.choices.iter().enumerate() {
-                    row(fns, ctx, COMBO_ITEM_HEIGHT, 1);
+                    row(fns, ctx, item_h, 1);
                     let t = cstr(&fns.localize(choice));
                     if unsafe { (fns.combo_item)(ctx, t.as_ptr().cast(), ALIGN_ROW) } != 0 {
                         editor.set(i, Value::Int(d.choice_value(o)), native);
@@ -1917,6 +1930,26 @@ fn draw_footer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_dropdowns_show_every_entry() {
+        // Short lists keep full-height rows and a popup just big enough.
+        assert_eq!(
+            combo_layout(3),
+            (COMBO_ITEM_HEIGHT, 3.0 * COMBO_ITEM_HEIGHT + COMBO_POPUP_PAD)
+        );
+        // Eleven entries used to be cut off by the old 900 cap; now they all fit at full height.
+        let (item, h) = combo_layout(11);
+        assert_eq!(item, COMBO_ITEM_HEIGHT);
+        assert!(h <= COMBO_POPUP_MAX_HEIGHT);
+        // The most a choice may have: shorter rows, still every one inside the popup.
+        let (item, h) = combo_layout(16);
+        assert!(item < COMBO_ITEM_HEIGHT && item >= COMBO_ITEM_MIN_HEIGHT);
+        assert!(16.0 * item + COMBO_POPUP_PAD <= COMBO_POPUP_MAX_HEIGHT + 0.01);
+        assert_eq!(h, 16.0 * item + COMBO_POPUP_PAD);
+        // No entries is not a division by zero.
+        assert!(combo_layout(0).0.is_finite());
+    }
 
     fn within(inner: Area, outer: Area) -> bool {
         inner[0] >= outer[0]
