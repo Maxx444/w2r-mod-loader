@@ -53,6 +53,7 @@ pub mod peer;
 pub use w2r_preview::pud;
 pub mod pudvalidate;
 pub mod scoreboard;
+pub mod scorebars;
 pub mod kickpanel;
 pub mod nativesettings;
 pub mod screenkit;
