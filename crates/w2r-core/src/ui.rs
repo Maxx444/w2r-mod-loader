@@ -81,6 +81,10 @@ pub trait Widgets {
     fn row_width(&self) -> f32 {
         1000.0
     }
+    /// The space the layout puts below each row right now (the style in effect sets it).
+    fn row_gap(&self) -> f32 {
+        ROW_GAP
+    }
     /// A row of cells of the given widths, left to right. A width of 0 shares what the others
     /// leave.
     fn row_cells(&self, height: f32, widths: &[f32]) {
@@ -108,7 +112,8 @@ struct Measured<'a> {
 
 impl Widgets for Measured<'_> {
     fn row(&self, height: f32, cols: i32) {
-        self.height.set(self.height.get() + height + ROW_GAP);
+        self.height
+            .set(self.height.get() + height + self.inner.row_gap());
         self.inner.row(height, cols);
     }
     fn label(&self, text: &str) {
@@ -150,8 +155,12 @@ impl Widgets for Measured<'_> {
     fn row_width(&self) -> f32 {
         self.inner.row_width()
     }
+    fn row_gap(&self) -> f32 {
+        self.inner.row_gap()
+    }
     fn row_cells(&self, height: f32, widths: &[f32]) {
-        self.height.set(self.height.get() + height + ROW_GAP);
+        self.height
+            .set(self.height.get() + height + self.inner.row_gap());
         self.inner.row_cells(height, widths);
     }
     fn label_coloured(&self, text: &str, colour: u32) {
@@ -544,7 +553,9 @@ pub fn draw_plugin_list(
         }
         let m = Measured {
             inner: w,
-            height: Cell::new(CARD_TOP_H + ROW_GAP),
+            // The card's frame has its own style: measure with the gap in effect inside it, not
+            // the list's, or every row adds empty space at the bottom of the card.
+            height: Cell::new(CARD_TOP_H + w.row_gap()),
         };
 
         // The name, with the version against the right edge, then the author in gold.
@@ -951,6 +962,57 @@ mod tests {
                 "wrapped \"a much longer line that wraps\"".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn a_card_is_measured_with_the_row_gap_in_effect() {
+        struct Tight(FakeWidgets, f32);
+        impl Widgets for Tight {
+            fn row(&self, height: f32, cols: i32) {
+                self.0.row(height, cols)
+            }
+            fn label(&self, text: &str) {
+                self.0.label(text)
+            }
+            fn button(&self, text: &str) -> bool {
+                self.0.button(text)
+            }
+            fn checkbox(&self, text: &str, value: &mut bool) -> bool {
+                self.0.checkbox(text, value)
+            }
+            fn slider(&self, text: &str, value: &mut i32, min: i32, max: i32) -> bool {
+                self.0.slider(text, value, min, max)
+            }
+            fn row_gap(&self) -> f32 {
+                self.1
+            }
+        }
+        let measure = |gap: f32, id: &str| {
+            let mut rows = vec![PluginRow {
+                id: id.into(),
+                name: "P".into(),
+                version: "1".into(),
+                author: None,
+                description: None,
+                enabled: true,
+                enabled_at_launch: true,
+                running: true,
+                slow: false,
+                error: None,
+            }];
+            let w = Tight(FakeWidgets::default(), gap);
+            draw_plugin_list(&w, [0; 4], &[], &mut rows, |w, _| {
+                for _ in 0..10 {
+                    w.row(ROW_H, 1);
+                    w.label("x");
+                }
+            });
+            CARD_HEIGHTS.with(|h| h.borrow()[id])
+        };
+        let loose = measure(ROW_GAP, "loose");
+        let tight = measure(4.0, "tight");
+        // Top row, name, status and ten rows: 13 gaps, each 20 units smaller.
+        assert_eq!(loose - tight, 13.0 * (ROW_GAP - 4.0));
     }
 
     #[test]

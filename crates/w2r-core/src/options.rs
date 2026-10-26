@@ -507,6 +507,15 @@ impl Widgets for GameWidgets<'_> {
     fn row_width(&self) -> f32 {
         self.usable(3) * (1.0 - 2.0 * self.inset())
     }
+    fn row_gap(&self) -> f32 {
+        // The style's row spacing, which the card's skin sets inside a card.
+        let gap = self.read_f32(CTX_SPACING_Y);
+        if gap.is_finite() && (0.0..=200.0).contains(&gap) {
+            gap
+        } else {
+            crate::ui::ROW_GAP
+        }
+    }
     fn row_cells(&self, height: f32, widths: &[f32]) {
         if widths.is_empty() || widths.len() > 8 {
             return self.row(height, widths.len() as i32);
