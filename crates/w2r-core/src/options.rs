@@ -436,6 +436,23 @@ impl Widgets for GameWidgets<'_> {
             _ => false,
         }
     }
+    fn combo(&self, key: &str, text: &str, choices: &[&str], selected: &mut usize) -> bool {
+        // As the options screen's dropdown row: the caption, then the dropdown.
+        self.label(text);
+        let ctx = self.ctx;
+        let drawn = Self::call("ComboBegin", || {
+            crate::settingsscreen::card_combo(ctx, key, choices, selected)
+        });
+        match drawn {
+            Some(changed) => changed,
+            None => {
+                // No dropdown on this host: show the current entry.
+                let shown = choices.get(*selected).copied().unwrap_or("");
+                self.label(shown);
+                false
+            }
+        }
+    }
     fn card_begin(&self, key: usize, height: f32) -> bool {
         self.row(height, 1);
         let name = cstr(&format!("w2rpm_plugin_card_{key}"));
