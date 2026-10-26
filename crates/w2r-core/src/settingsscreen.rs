@@ -1673,6 +1673,15 @@ fn draw_setting_row(
                 }
             };
             let tb = &mut screen.edits[slot];
+            // The box keeps its own copy of the text. While it is not being typed in, follow the
+            // value, so a change from elsewhere shows: a plugin filling it in during Apply, or
+            // Cancel putting the old text back.
+            if !tb.focused && buffer_text(&tb.buf) != value.str() {
+                tb.buf.fill(0);
+                let bytes = value.str().as_bytes();
+                let n = bytes.len().min(EDIT_BUFFER - 1);
+                tb.buf[..n].copy_from_slice(&bytes[..n]);
+            }
             let typing = text_edit(fns, ctx, &mut tb.buf);
             // Stored when the box loses focus, so the value never holds half-typed text, and only
             // after it had focus, so merely showing a value never rewrites it.
