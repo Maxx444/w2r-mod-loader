@@ -530,6 +530,14 @@ impl Editor {
     /// A new visit to the screen: host and plugin values are read again from their owners,
     /// since they may have changed, and become the baseline.
     pub fn enter(&mut self, native: &dyn Native, owners: &dyn Owners) {
+        self.load_owned(owners);
+        self.snapshot = self.registry.snapshot(native);
+        self.baseline = self.snapshot.clone();
+        self.dirty = false;
+    }
+
+    /// Reads every host and plugin value from its owner (the game's own values are read live).
+    fn load_owned(&mut self, owners: &dyn Owners) {
         for i in 0..self.registry.len() {
             let def = self.registry.def(i);
             if def.owner == Owner::Game {
@@ -543,9 +551,6 @@ impl Editor {
             }
             self.registry.set(i, value, &mut NoNative);
         }
-        self.snapshot = self.registry.snapshot(native);
-        self.baseline = self.snapshot.clone();
-        self.dirty = false;
     }
 
     pub fn get(&self, i: usize, native: &dyn Native) -> Value {
@@ -573,6 +578,11 @@ impl Editor {
                 .map(|&i| (self.registry.def(i), &current[i]))
                 .collect();
             owners.store(&pairs);
+            // Owners may change values while they store (a plugin reacting to
+            // W2R_EVT_SETTINGS_CHANGED, for example clearing a one-shot checkbox or applying a
+            // profile's colors): show what they hold now, instead of the screen's own copy until
+            // the next visit.
+            self.load_owned(&*owners);
         }
         native.persist();
         self.snapshot = self.registry.snapshot(native);
@@ -1218,6 +1228,44 @@ mod tests {
         assert_eq!(o.stores, vec![vec![("fade".to_owned(), Value::Int(20))]]);
         e.apply(&mut g, &mut o);
         assert_eq!(o.stores.len(), 1, "already stored");
+    }
+
+    /// Owners that, like a plugin handling the settings event, change another value while
+    /// storing: storing "fade" sets "lines" to 3.
+    #[derive(Default)]
+    struct ReactingOwners(FakeOwners);
+
+    impl Owners for ReactingOwners {
+        fn load(&self, def: &SettingDef) -> Option<Value> {
+            self.0.load(def)
+        }
+        fn store(&mut self, changed: &[(&SettingDef, &Value)]) {
+            self.0.store(changed);
+            if changed.iter().any(|(d, _)| d.key == "fade") {
+                self.0.stored.insert("lines".into(), Value::Int(3));
+            }
+        }
+    }
+
+    #[test]
+    fn apply_shows_what_owners_changed_while_storing() {
+        let mut e = Editor::new(sample());
+        let mut g = FakeGame::default();
+        let mut o = ReactingOwners::default();
+        e.enter(&g, &o);
+        let fade = e.registry.find(&plugin("w2r-chat"), "fade").unwrap();
+        let lines = e.registry.find(&plugin("w2r-chat"), "lines").unwrap();
+        e.set(fade, Value::Int(20), &mut g);
+        e.apply(&mut g, &mut o);
+        assert_eq!(
+            e.get(lines, &g),
+            Value::Int(3),
+            "the owner's change shows at once"
+        );
+        assert!(!e.dirty());
+        // It is the new baseline: applying again stores nothing more.
+        e.apply(&mut g, &mut o);
+        assert_eq!(o.0.stores.len(), 1);
     }
 
     #[test]
