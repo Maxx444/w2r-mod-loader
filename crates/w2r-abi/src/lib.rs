@@ -164,11 +164,40 @@ pub struct W2rUi {
         unsafe extern "C" fn(ctx: *mut c_void, text: W2rStr, buf: *mut u8, cap: u32) -> i32,
     /// Appended with `text_edit`. 0 greys out and disables the rows that follow, 1 restores them.
     pub set_active: unsafe extern "C" fn(ctx: *mut c_void, active: i32),
+    /// Appended after `set_active`: check `struct_size >= W2R_UI_COLOR_EDIT_SIZE` first. A color
+    /// row: the caption, a swatch, and a `#RRGGBB` button that opens the host's color editor (the
+    /// options screen's). `hex` is the plugin's own 7-byte buffer, `rrggbb` and a NUL; 1 on the
+    /// frame the player pressed OK on a different color, with `hex` rewritten.
+    pub color_edit: unsafe extern "C" fn(ctx: *mut c_void, text: W2rStr, hex: *mut u8) -> i32,
+    /// Appended after `color_edit`: check `struct_size >= W2R_UI_COMBO_SIZE` first. A dropdown
+    /// row like the options screen's: the caption and a dropdown of `count` choices (2 to
+    /// `W2R_MAX_SETTING_CHOICE_COUNT`, each at most `W2R_MAX_SETTING_CHOICE` bytes), showing
+    /// `*selected`. 1 on the frame the player picked a different entry, with `*selected` set to it.
+    pub combo: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        text: W2rStr,
+        choices: *const W2rStr,
+        count: u32,
+        selected: *mut i32,
+    ) -> i32,
 }
 
-/// `W2rUi.struct_size` of the first release: a plugin that wants `text_edit` or `set_active`
-/// checks `ui.struct_size >= W2R_UI_TEXT_EDIT_SIZE`.
-pub const W2R_UI_TEXT_EDIT_SIZE: u32 = core::mem::size_of::<W2rUi>() as u32;
+/// `W2rUi.struct_size` with `text_edit` and `set_active`: a plugin that wants them checks
+/// `ui.struct_size >= W2R_UI_TEXT_EDIT_SIZE`.
+pub const W2R_UI_TEXT_EDIT_SIZE: u32 =
+    (core::mem::offset_of!(W2rUi, set_active) + core::mem::size_of::<usize>()) as u32;
+
+/// `W2rUi.struct_size` with `color_edit`: a plugin that wants it checks
+/// `ui.struct_size >= W2R_UI_COLOR_EDIT_SIZE`.
+pub const W2R_UI_COLOR_EDIT_SIZE: u32 =
+    (core::mem::offset_of!(W2rUi, color_edit) + core::mem::size_of::<usize>()) as u32;
+
+/// `W2rUi.struct_size` with `combo`: a plugin that wants it checks
+/// `ui.struct_size >= W2R_UI_COMBO_SIZE`.
+pub const W2R_UI_COMBO_SIZE: u32 = core::mem::size_of::<W2rUi>() as u32;
+
+/// Bytes in a `color_edit` buffer: six hex digits and a NUL.
+pub const W2R_COLOR_HEX_BYTES: u32 = 7;
 
 // ---- host table: provided by the host, one instance per plugin -----------------------------
 /// The host fills every version-1 field, so these pointers are never null for a version-1 host.
@@ -432,7 +461,10 @@ mod tests {
         assert_eq!(size_of::<W2rStr>(), 8);
         assert_eq!(size_of::<W2rEvent>(), 12);
         assert_eq!(size_of::<W2rPlugin>(), 20);
-        assert_eq!(size_of::<W2rUi>(), 32);
+        assert_eq!(size_of::<W2rUi>(), 40);
+        assert_eq!(W2R_UI_TEXT_EDIT_SIZE, 32);
+        assert_eq!(W2R_UI_COLOR_EDIT_SIZE, 36);
+        assert_eq!(W2R_UI_COMBO_SIZE, 40);
         assert_eq!(size_of::<W2rHost>(), 104);
         assert_eq!(W2R_HOST_V1_SIZE, 84);
         assert_eq!(W2R_PLUGIN_V1_SIZE, 20);
@@ -449,7 +481,8 @@ mod tests {
         assert_eq!(size_of::<W2rStr>(), 16);
         assert_eq!(size_of::<W2rEvent>(), 16);
         assert_eq!(size_of::<W2rPlugin>(), 40);
-        assert_eq!(size_of::<W2rUi>(), 64);
+        assert_eq!(size_of::<W2rUi>(), 80);
+        assert_eq!(W2R_UI_TEXT_EDIT_SIZE, 64);
         assert_eq!(size_of::<W2rHost>(), 200);
         assert_eq!(W2R_HOST_MAP_FOLDER_SIZE, 192);
         assert_eq!(size_of::<W2rSettingDef>(), 168);

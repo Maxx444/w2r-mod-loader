@@ -161,7 +161,23 @@ typedef struct W2rUi {
     /* Appended after the first release: check ui->struct_size covers these before using them. */
     int32_t (W2R_CALL *text_edit)(void *ctx, W2rStr text, char *buf, uint32_t cap); /* 1 when changed */
     void (W2R_CALL *set_active)(void *ctx, int32_t active); /* 0 greys out the rows after it */
+    /* Appended after set_active: check ui->struct_size >= W2R_UI_COLOR_EDIT_SIZE. A color row:
+       caption, swatch and a #RRGGBB button that opens the host's color editor. hex is the
+       plugin's own 7-byte buffer, "rrggbb" and a NUL; 1 when the player pressed OK on a
+       different color, with hex rewritten. */
+    int32_t (W2R_CALL *color_edit)(void *ctx, W2rStr text, char *hex);
+    /* Appended after color_edit: check ui->struct_size >= W2R_UI_COMBO_SIZE. A dropdown row:
+       caption and `count` choices (2..W2R_MAX_SETTING_CHOICE_COUNT, each at most
+       W2R_MAX_SETTING_CHOICE bytes) showing *selected; 1 when the player picked a different
+       entry, with *selected set to it. */
+    int32_t (W2R_CALL *combo)(void *ctx, W2rStr text, const W2rStr *choices, uint32_t count,
+                              int32_t *selected);
 } W2rUi;
+
+#define W2R_UI_TEXT_EDIT_SIZE ((uint32_t)(offsetof(W2rUi, set_active) + sizeof(void *)))
+#define W2R_UI_COLOR_EDIT_SIZE ((uint32_t)(offsetof(W2rUi, color_edit) + sizeof(void *)))
+#define W2R_UI_COMBO_SIZE ((uint32_t)(offsetof(W2rUi, combo) + sizeof(void *)))
+#define W2R_COLOR_HEX_BYTES 7u
 
 /* ---- host table: provided by the host, one instance per plugin ------------------------- */
 typedef struct W2rHost {

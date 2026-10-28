@@ -86,6 +86,29 @@ Two calls were appended after the first release (`struct_size` grew; a plugin ch
 - `set_active(ctx, active)`: 0 greys out and disables the rows that follow, 1 restores them. A
   grey-out left open at the end of `on_ui` is closed by the host.
 
+One more was appended after those (`ui->struct_size >= W2R_UI_COLOR_EDIT_SIZE`; on an older host a
+plugin falls back to `text_edit`):
+
+- `color_edit(ctx, text, hex)`: a color row like the options screen's: the caption, a swatch, and
+  the value on a `#rrggbb` button that opens the host's color editor (the same one the options
+  screen uses: saturation / brightness square, hue strip, the new and the current color, a hex box,
+  OK / Cancel; no Reset to Default, since a plugin card has no declared default). `hex` is the
+  plugin's own buffer of `W2R_COLOR_HEX_BYTES` (7) bytes, six hex digits and a NUL; anything else
+  shows as black. The call returns 1 on the frame after the player pressed OK on a different color,
+  with `hex` rewritten as six lowercase digits and a NUL; Cancel changes nothing. The row is known
+  by the plugin and its caption, so captions of color rows should differ. While the editor is open
+  the plugin manager behind it is read-only; opening the manager again closes an editor left open.
+
+And one after `color_edit` (`ui->struct_size >= W2R_UI_COMBO_SIZE`):
+
+- `combo(ctx, text, choices, count, selected)`: a dropdown row like the options screen's: the
+  caption, then a dropdown showing `choices[*selected]`, the game's own dropdown widget. `count` is
+  2 to `W2R_MAX_SETTING_CHOICE_COUNT` (16) and each choice at most `W2R_MAX_SETTING_CHOICE` (64)
+  bytes; otherwise, or with a null pointer, a no-op that reports 0. Unlike a declared dropdown the
+  list is the plugin's to change every frame. A `*selected` out of range shows the last entry. The
+  call returns 1 on the frame the player picked a different entry, with `*selected` set to it.
+  The open dropdown's rows shrink to fit, as on the options screen.
+
 ## Declared settings
 
 Appended after `create_map_folder` (`host->struct_size >= W2R_HOST_SETTINGS_DECLARE_SIZE`; an

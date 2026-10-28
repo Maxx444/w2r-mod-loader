@@ -413,6 +413,46 @@ impl Widgets for GameWidgets<'_> {
         let _ = typing;
         before != *buf
     }
+    fn color_edit(&self, key: &str, text: &str, hex: &mut [u8; 6]) -> bool {
+        // As the options screen's color row: the caption, a swatch, and the value on a button
+        // that opens the color editor.
+        let shown = String::from_utf8_lossy(hex).into_owned();
+        self.label(text);
+        let ctx = self.ctx;
+        let drawn = Self::call("NkFillRect", || {
+            crate::settingsscreen::card_swatch(ctx, &shown)
+        });
+        if !drawn {
+            self.label("");
+        }
+        if self.button(&format!("#{shown}")) {
+            crate::settingsscreen::card_color_start(key, text, &shown);
+        }
+        match crate::settingsscreen::card_color_take(key) {
+            Some(new) if new.len() == 6 && new.as_bytes() != hex.as_slice() => {
+                hex.copy_from_slice(new.as_bytes());
+                true
+            }
+            _ => false,
+        }
+    }
+    fn combo(&self, key: &str, text: &str, choices: &[&str], selected: &mut usize) -> bool {
+        // As the options screen's dropdown row: the caption, then the dropdown.
+        self.label(text);
+        let ctx = self.ctx;
+        let drawn = Self::call("ComboBegin", || {
+            crate::settingsscreen::card_combo(ctx, key, choices, selected)
+        });
+        match drawn {
+            Some(changed) => changed,
+            None => {
+                // No dropdown on this host: show the current entry.
+                let shown = choices.get(*selected).copied().unwrap_or("");
+                self.label(shown);
+                false
+            }
+        }
+    }
     fn card_begin(&self, key: usize, height: f32) -> bool {
         self.row(height, 1);
         let name = cstr(&format!("w2rpm_plugin_card_{key}"));
@@ -466,6 +506,15 @@ impl Widgets for GameWidgets<'_> {
     }
     fn row_width(&self) -> f32 {
         self.usable(3) * (1.0 - 2.0 * self.inset())
+    }
+    fn row_gap(&self) -> f32 {
+        // The style's row spacing, which the card's skin sets inside a card.
+        let gap = self.read_f32(CTX_SPACING_Y);
+        if gap.is_finite() && (0.0..=200.0).contains(&gap) {
+            gap
+        } else {
+            crate::ui::ROW_GAP
+        }
     }
     fn row_cells(&self, height: f32, widths: &[f32]) {
         if widths.is_empty() || widths.len() > 8 {
@@ -751,6 +800,7 @@ fn draw_version(nk: &Nk) {
                     let down = read(CTX_MOUSE_LEFT_DOWN).cast::<i32>().read_unaligned() != 0;
                     let clicked = read(CTX_MOUSE_LEFT_CLICKED).cast::<u32>().read_unaligned() != 0;
                     if down && clicked {
+                        crate::settingsscreen::card_color_cancel();
                         MANAGER_OPEN.store(true, Ordering::Release);
                     }
                 }
@@ -783,6 +833,13 @@ fn draw_manager(nk: &Nk) {
     let close_y = y + h - CLOSE_H;
     let list_h = close_y - MANAGER_GAP - list_top;
 
+    // While a card's color editor is open, the manager stays behind it and takes no input.
+    let editing = crate::settingsscreen::card_color_open();
+    let flags = if editing {
+        WINDOW_NO_SCROLLBAR | WINDOW_BACKGROUND
+    } else {
+        WINDOW_NO_SCROLLBAR
+    };
     let prev_skin = nk.push_skin(nk.window_skin());
     unsafe {
         let opened = (nk.begin_window)(
@@ -792,9 +849,10 @@ fn draw_manager(nk: &Nk) {
             0.0,
             ui_w,
             UI_HEIGHT,
-            WINDOW_NO_SCROLLBAR,
+            flags,
         ) != 0;
         if opened {
+            crate::settingsscreen::set_window_read_only(ctx, editing);
             (nk.space_begin)(ctx, 1, 0.0, 1000);
             let win = (ctx as *const u8)
                 .add(CTX_CURRENT_WINDOW)
@@ -853,4 +911,8 @@ fn draw_manager(nk: &Nk) {
         (nk.end_window)(ctx);
     }
     nk.push_skin(prev_skin);
+    // Drawn after the manager, so it is on top. Also when a card opened it during this frame.
+    if crate::settingsscreen::card_color_open() {
+        crate::settingsscreen::draw_card_color_popup();
+    }
 }
