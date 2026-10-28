@@ -212,6 +212,9 @@ pub struct Installed {
     /// The newer version the cached index offers, if any.
     pub update: Option<Version>,
     pub problem: Option<String>,
+    /// The enabled installed plugin that replaces this one (`replaces` in its `plugin.json`); the
+    /// host skips this plugin while that one loads.
+    pub replaced_by: Option<String>,
 }
 
 /// Everything the window shows, loaded without the network.
@@ -270,9 +273,34 @@ impl View {
                     .filter(|f| f.id == p.id)
                     .map(|f| f.problem.clone())
                     .reduce(|a, b| format!("{a}; {b}")),
+                replaced_by: None,
             });
         }
+        let replaces: Vec<(String, Vec<Dependency>)> = v
+            .installed
+            .iter()
+            .filter(|p| p.enabled)
+            .filter_map(|p| Some((p.id.clone(), root.installed_manifest(&p.id)?.replaces)))
+            .filter(|(_, list)| !list.is_empty())
+            .collect();
+        mark_replaced(&mut v.installed, &replaces);
         v
+    }
+}
+
+/// Sets `replaced_by` on each row that some plugin in `replaces` (id, its `replaces` list)
+/// supersedes at the row's version.
+pub fn mark_replaced(rows: &mut [Installed], replaces: &[(String, Vec<Dependency>)]) {
+    for row in rows {
+        row.replaced_by = replaces
+            .iter()
+            .find(|(by, list)| {
+                *by != row.id
+                    && list
+                        .iter()
+                        .any(|r| r.id == row.id && r.version_req.matches(&row.version))
+            })
+            .map(|(by, _)| by.clone());
     }
 }
 
@@ -485,7 +513,25 @@ mod dep_tests {
             capabilities: vec![],
             update: None,
             problem: None,
+            replaced_by: None,
         }
+    }
+
+    #[test]
+    fn mark_replaced_names_the_replacer_within_its_version_range() {
+        let mut rows = vec![
+            installed("old-plugin", "0.2.0", true),
+            installed("kept-plugin", "1.0.0", true),
+            installed("new-plugin", "1.0.0", true),
+        ];
+        let replaces = vec![(
+            "new-plugin".to_string(),
+            vec![dep("old-plugin", "<1.0.0"), dep("kept-plugin", "<1.0.0")],
+        )];
+        mark_replaced(&mut rows, &replaces);
+        assert_eq!(rows[0].replaced_by.as_deref(), Some("new-plugin"));
+        assert_eq!(rows[1].replaced_by, None, "1.0.0 is outside <1.0.0");
+        assert_eq!(rows[2].replaced_by, None);
     }
 
     fn dep(id: &str, req: &str) -> Dependency {

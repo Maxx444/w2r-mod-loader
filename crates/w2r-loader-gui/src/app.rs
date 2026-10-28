@@ -628,6 +628,13 @@ impl App {
                                     if !p.enabled {
                                         theme::badge(ui, "Disabled", theme::MUTED);
                                     }
+                                    if let Some(by) = &p.replaced_by {
+                                        theme::badge(
+                                            ui,
+                                            &format!("Replaced by {by}"),
+                                            theme::WARN,
+                                        );
+                                    }
                                 });
                                 ui.label(theme::muted(format!(
                                     "by {}",
@@ -1884,6 +1891,30 @@ fn dep_rows(
     }
 }
 
+/// The plugins an install replaces, shared by Details and the consent window: an installed, enabled
+/// match is turned off when this plugin is installed enabled (the manager does it in the same
+/// write as the install, and the host would skip it at load anyway).
+fn replaces_rows(ui: &mut egui::Ui, replaces: &[Dependency], installed: &[Installed]) {
+    for r in replaces {
+        let found = installed
+            .iter()
+            .find(|p| p.id == r.id && r.version_req.matches(&p.version));
+        ui.horizontal(|ui| {
+            match found {
+                Some(p) if p.enabled => theme::badge(
+                    ui,
+                    &format!("installed {}, will be turned off", p.version),
+                    theme::WARN,
+                ),
+                Some(p) => theme::badge(ui, &format!("installed {}, off", p.version), theme::MUTED),
+                None => theme::badge(ui, "not installed", theme::MUTED),
+            }
+            theme::pill(ui, &r.id, theme::MUTED);
+            ui.label(theme::muted(r.version_req.to_string()));
+        });
+    }
+}
+
 /// One plugin's block in the consent window.
 fn consent_item_ui(
     ui: &mut egui::Ui,
@@ -1921,6 +1952,11 @@ fn consent_item_ui(
             ui.add_space(2.0);
             ui.label(RichText::new("Needs").strong());
             dep_rows(ui, &m.dependencies, installed, planned);
+        }
+        if !m.replaces.is_empty() {
+            ui.add_space(2.0);
+            ui.label(RichText::new("Replaces").strong());
+            replaces_rows(ui, &m.replaces, installed);
         }
         ui.add_space(2.0);
         ui.label(RichText::new("Capabilities").strong());
@@ -1977,6 +2013,10 @@ fn details_ui(
     if !m.dependencies.is_empty() {
         ui.label(theme::muted("Needs:"));
         dep_rows(ui, &m.dependencies, installed, &[]);
+    }
+    if !m.replaces.is_empty() {
+        ui.label(theme::muted("Replaces:"));
+        replaces_rows(ui, &m.replaces, installed);
     }
     if m.capabilities.is_empty() {
         ui.label(theme::muted("Asks for no capabilities."));

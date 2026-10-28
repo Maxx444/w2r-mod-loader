@@ -70,9 +70,15 @@ impl Root {
     /// The author in an installed plugin's `plugin.json`; `None` when it is missing or invalid
     /// (display only: `verify` reports a bad manifest).
     pub fn installed_author(&self, id: &str) -> Option<String> {
+        self.installed_manifest(id).map(|m| m.author)
+    }
+
+    /// An installed plugin's validated `plugin.json`; `None` when it is missing or invalid
+    /// (display only: `verify` reports a bad manifest).
+    pub fn installed_manifest(&self, id: &str) -> Option<manifest::Manifest> {
         let dir = self.plugin_dir(Id::new(id).ok()?);
         let raw = read_bounded(&dir.join("plugin.json"), manifest::MAX_BYTES).ok()?;
-        manifest::validate(&raw).ok().map(|m| m.author)
+        manifest::validate(&raw).ok()
     }
 
     pub fn save_state(&self, state: &State) -> Result<(), Error> {
