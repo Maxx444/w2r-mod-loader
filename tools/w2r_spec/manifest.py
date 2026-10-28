@@ -8,6 +8,7 @@ FIELDS = {
     "schema", "id", "name", "version", "author", "description", "entry", "abi",
     "game_builds", "capabilities", "affects_simulation", "dependencies",
 }
+OPTIONAL_FIELDS = {"replaces"}
 CAPABILITIES = {"game.read", "chat.read", "chat.write", "net.send", "hooks.raw"}
 RESERVED_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {
     "LPT%d" % i for i in range(1, 10)
@@ -48,7 +49,7 @@ def _req_ok(req):
 REASONS = {
     "too_large", "not_json", "duplicate_key", "not_object", "unknown_field", "missing_field",
     "bad_schema", "bad_id", "bad_type", "bad_string", "too_long", "bad_version", "bad_entry",
-    "bad_abi", "bad_build", "bad_capability", "bad_dependency",
+    "bad_abi", "bad_build", "bad_capability", "bad_dependency", "bad_replaces",
 }
 
 
@@ -106,6 +107,16 @@ def _deps_ok(deps, own_id):
     return None
 
 
+def _replaces_ok(replaces, own_id, deps):
+    """`replaces` has the shape of `dependencies`; no id may be both replaced and depended on."""
+    err = _deps_ok(replaces, own_id)
+    if err == "bad_type":
+        return err
+    if err or {d["id"] for d in replaces} & {d["id"] for d in deps}:
+        return "bad_replaces"
+    return None
+
+
 def _caps_ok(caps):
     if not isinstance(caps, list):
         return "bad_type"
@@ -125,7 +136,7 @@ def validate_manifest(raw):
         return r.code
     if not isinstance(doc, dict):
         return "not_object"
-    if set(doc) - FIELDS:
+    if set(doc) - FIELDS - OPTIONAL_FIELDS:
         return "unknown_field"
     if FIELDS - set(doc):
         return "missing_field"
@@ -148,4 +159,9 @@ def validate_manifest(raw):
         return err
     if not isinstance(doc["affects_simulation"], bool):
         return "bad_type"
-    return _deps_ok(doc["dependencies"], doc["id"]) or "ok"
+    err = _deps_ok(doc["dependencies"], doc["id"])
+    if err:
+        return err
+    if "replaces" in doc:
+        return _replaces_ok(doc["replaces"], doc["id"], doc["dependencies"]) or "ok"
+    return "ok"

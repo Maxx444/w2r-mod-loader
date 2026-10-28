@@ -113,6 +113,16 @@ fn load_order(accepted: Vec<Candidate>) -> (Vec<Candidate>, Vec<Candidate>) {
             .count();
         indegree.insert(id.clone(), n);
     }
+    // A plugin that replaces another loads first, so it is known to have loaded when the replaced
+    // one's turn comes (`E_REPLACED`).
+    for (rid, r) in &by_id {
+        for (tid, t) in &by_id {
+            if r.manifest.replaces_plugin(tid, &t.manifest.version) {
+                dependents.entry(rid.clone()).or_default().push(tid.clone());
+                *indegree.get_mut(tid).expect("known id") += 1;
+            }
+        }
+    }
     let mut ready: BTreeSet<String> = indegree
         .iter()
         .filter(|(_, n)| **n == 0)
@@ -261,7 +271,21 @@ pub fn load_all(
     let mut loaded: BTreeMap<String, Version> = BTreeMap::new();
     // (id, manifest version text, pin) of each loaded plugin that counts for the fingerprint.
     let mut simulation: Vec<(String, String, [u8; 32])> = Vec::new();
+    // What each loaded plugin replaces. A replaced plugin is skipped only because its replacer
+    // really loaded; if the replacer fails, the old plugin still runs.
+    let mut replacers: Vec<(String, Vec<manifest::Dependency>)> = Vec::new();
     for c in order {
+        if let Some((by, _)) = replacers.iter().find(|(_, list)| {
+            list.iter()
+                .any(|r| r.id == c.st.id && r.version_req.matches(&c.manifest.version))
+        }) {
+            log.line(
+                W2R_LOG_WARN,
+                &c.st.id,
+                &format!("E_REPLACED: replaced by {by}, which is loaded"),
+            );
+            continue;
+        }
         let unmet = c
             .manifest
             .dependencies
@@ -286,6 +310,9 @@ pub fn load_all(
             .is_ok()
         {
             loaded.insert(c.st.id.clone(), c.manifest.version.clone());
+            if !c.manifest.replaces.is_empty() {
+                replacers.push((c.st.id.clone(), c.manifest.replaces.clone()));
+            }
             // A raw hook can change anything, so it always counts (docs/load-policy.md).
             if c.manifest.affects_simulation || caps.contains(&caps::HOOKS_RAW) {
                 simulation.push((

@@ -21,6 +21,7 @@ next plugin. A failing plugin never stops the game or other plugins.
 | 6 | `E_CAPS` | manifest `capabilities` is not a subset of `approved_capabilities` |
 | 7 | `E_TAG` | an already-accepted plugin has the same 4-byte peer tag (the later plugin by id order is refused) |
 | 8 | `E_DEP` | a dependency is missing, disabled, failed an earlier check, does not satisfy `version_req`, or is part of a dependency cycle (every member of the cycle fails) |
+| 8b | `E_REPLACED` | another plugin that **did load** lists this one in `replaces` and its `version_req` matches this plugin's version (decided at this plugin's turn, before check 8) |
 | 9 | `E_ENTRY` | the DLL cannot be opened or loaded, has no `w2r_plugin_main`, the call faults, or it returns null or a `W2rPlugin` whose `struct_size` is below the version-1 minimum or whose `on_load` is null |
 | 10 | `E_LOAD` | `on_load` returns a non-zero status or faults |
 
@@ -33,6 +34,11 @@ Details:
   plugin at its turn. A plugin whose dependency did **not end up loaded**, for any reason (checks
   1-10, including `E_ENTRY` and `E_LOAD` of the dependency), fails check 8 itself; this propagates
   through chains. A dependency that is loaded must also satisfy `version_req`.
+- **Replaces.** A plugin that replaces another counts as that plugin's dependency for ordering
+  only: the replacer loads first. The replaced plugin is skipped with `E_REPLACED` only if the
+  replacer really loaded. If the replacer fails (any of checks 1-10), the replaced plugin still
+  runs, so a broken update never leaves the player with neither. Plugins that depend on a replaced
+  plugin then fail check 8 (it is not loaded); the replacer is meant to be what they use.
 - **Tag refusal is not revisited.** `E_TAG` is decided among plugins that passed checks 1 to 6, by
   id order. If the earlier plugin later fails check 8, 9 or 10, the later one stays refused for this
   launch.

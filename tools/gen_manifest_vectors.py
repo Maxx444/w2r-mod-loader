@@ -92,6 +92,22 @@ OBJECT_CASES = [
     ("dep_bad_id", "bad_dependency", mut(dependencies=[{"id": "Bad", "version_req": ">=1.0.0"}])),
     ("dep_too_many", "bad_dependency", mut(dependencies=[
         {"id": "dep-%02d" % i, "version_req": ">=1.0.0"} for i in range(17)])),
+    ("replaces_ok", "ok", mut(replaces=[{"id": "old-plugin", "version_req": "<1.0.0"}])),
+    ("replaces_empty_ok", "ok", mut(replaces=[])),
+    ("replaces_with_dependency_ok", "ok", mut(dependencies=[DEP], replaces=[
+        {"id": "old-plugin", "version_req": ">=0.1.0,<1.0.0"}])),
+    ("replaces_not_list", "bad_type", mut(replaces="old-plugin")),
+    ("replaces_self", "bad_replaces", mut(replaces=[{"id": "example-plugin", "version_req": "<1.0.0"}])),
+    ("replaces_duplicate", "bad_replaces", mut(replaces=[
+        {"id": "old-plugin", "version_req": "<1.0.0"}, {"id": "old-plugin", "version_req": ">=2.0.0"}])),
+    ("replaces_bad_req", "bad_replaces", mut(replaces=[{"id": "old-plugin", "version_req": "^1.0"}])),
+    ("replaces_extra_field", "bad_replaces", mut(replaces=[{"id": "old-plugin", "version_req": "<1.0.0", "x": 1}])),
+    ("replaces_bad_id", "bad_replaces", mut(replaces=[{"id": "Bad", "version_req": "<1.0.0"}])),
+    ("replaces_too_many", "bad_replaces", mut(replaces=[
+        {"id": "old-%02d" % i, "version_req": "<1.0.0"} for i in range(17)])),
+    ("replaces_also_dependency", "bad_replaces", mut(dependencies=[DEP], replaces=[
+        {"id": "other-plugin", "version_req": "<1.0.0"}])),
+    ("unknown_field_still_refused", "unknown_field", mut(replace=[])),
     ("name_control_char", "bad_string", mut(name="Bad\u0007Name")),
     ("name_empty", "bad_string", mut(name="")),
     ("name_too_long", "too_long", mut(name="n" * 65)),

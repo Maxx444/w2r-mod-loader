@@ -27,6 +27,8 @@ const FIELDS: [&str; 12] = [
     "affects_simulation",
     "dependencies",
 ];
+/// Allowed but not required (docs/manifest.md).
+const OPTIONAL_FIELDS: [&str; 1] = ["replaces"];
 
 /// A reason code from docs/manifest.md, or `"ok"`.
 pub type Reason = &'static str;
@@ -117,9 +119,19 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     pub affects_simulation: bool,
     pub dependencies: Vec<Dependency>,
+    /// Plugins this one supersedes (`replaces`; empty when absent). Same shape as a dependency:
+    /// an id and the versions of it that are replaced.
+    pub replaces: Vec<Dependency>,
 }
 
 impl Manifest {
+    /// Whether this manifest replaces the plugin `id` at `version`.
+    pub fn replaces_plugin(&self, id: &str, version: &Version) -> bool {
+        self.replaces
+            .iter()
+            .any(|r| r.id == id && r.version_req.matches(version))
+    }
+
     pub fn supports_build(&self, b: Build) -> bool {
         self.game_builds.iter().any(|r| r.contains(b))
     }
@@ -227,6 +239,19 @@ fn dependencies(v: &Value, own_id: &str) -> Result<Vec<Dependency>, Reason> {
     Ok(out)
 }
 
+/// The optional `replaces` list: the same entries as `dependencies`, with `bad_replaces` for any
+/// problem, and no id may also be a dependency (a plugin cannot need what it replaces).
+fn replaces(v: &Value, own_id: &str, deps: &[Dependency]) -> Result<Vec<Dependency>, Reason> {
+    let list = dependencies(v, own_id).map_err(|r| match r {
+        "bad_type" => "bad_type",
+        _ => "bad_replaces",
+    })?;
+    if list.iter().any(|r| deps.iter().any(|d| d.id == r.id)) {
+        return Err("bad_replaces");
+    }
+    Ok(list)
+}
+
 /// Validates raw `plugin.json` bytes. `Err` carries the reason code.
 pub fn validate(raw: &[u8]) -> Result<Manifest, Reason> {
     if raw.len() > MAX_BYTES {
@@ -234,7 +259,10 @@ pub fn validate(raw: &[u8]) -> Result<Manifest, Reason> {
     }
     let doc = json::parse(raw).map_err(|r| r.code())?;
     let pairs = doc.as_object().ok_or("not_object")?;
-    if pairs.iter().any(|(k, _)| !FIELDS.contains(&k.as_str())) {
+    if pairs
+        .iter()
+        .any(|(k, _)| !FIELDS.contains(&k.as_str()) && !OPTIONAL_FIELDS.contains(&k.as_str()))
+    {
         return Err("unknown_field");
     }
     if FIELDS.iter().any(|f| doc.get(f).is_none()) {
@@ -269,6 +297,10 @@ pub fn validate(raw: &[u8]) -> Result<Manifest, Reason> {
     let capabilities = capabilities(field("capabilities"))?;
     let affects_simulation = field("affects_simulation").as_bool().ok_or("bad_type")?;
     let dependencies = dependencies(field("dependencies"), &id)?;
+    let replaces = match doc.get("replaces") {
+        Some(v) => replaces(v, &id, &dependencies)?,
+        None => Vec::new(),
+    };
 
     Ok(Manifest {
         id,
@@ -283,6 +315,7 @@ pub fn validate(raw: &[u8]) -> Result<Manifest, Reason> {
         capabilities,
         affects_simulation,
         dependencies,
+        replaces,
     })
 }
 

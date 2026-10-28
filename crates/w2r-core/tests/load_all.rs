@@ -486,3 +486,52 @@ fn a_missing_or_bad_state_file_loads_nothing() {
     assert!(log.has("state.json refused (bad_schema)"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_loaded_replacer_refuses_the_plugin_it_replaces_only_within_its_version_range() {
+    let replaces = |id: &str, entry: &str, id_of_old: &str, req: &str| {
+        let mut m = manifest(id, entry);
+        set(&mut m, "replaces", arr(vec![dep(id_of_old, req)]));
+        m
+    };
+    // "a-old" sorts before "z-new", so id order alone would load it first.
+    let plugins = vec![
+        Plugin::new("a-old", "basic_plugin", manifest("a-old", "basic_plugin.dll")),
+        Plugin::new(
+            "z-new",
+            "basic_plugin",
+            replaces("z-new", "basic_plugin.dll", "a-old", "<2.0.0"),
+        ),
+        // Replaces a version this plugin is not (1.0.0 is below >=5.0.0): both load.
+        Plugin::new("b-kept", "basic_plugin", manifest("b-kept", "basic_plugin.dll")),
+        Plugin::new(
+            "y-other",
+            "basic_plugin",
+            replaces("y-other", "basic_plugin.dll", "b-kept", ">=5.0.0"),
+        ),
+        // The replacer fails to load, so the plugin it replaces keeps running.
+        Plugin::new("c-fallback", "basic_plugin", manifest("c-fallback", "basic_plugin.dll")),
+        Plugin::new(
+            "x-broken",
+            "load_fails",
+            replaces("x-broken", "load_fails.dll", "c-fallback", "<2.0.0"),
+        ),
+    ];
+    let root = root_with("replaces", &plugins);
+    let log = Rc::new(Lines::default());
+    let reg = load_all(&root, running(), log.clone(), None, Services::none()).registry;
+
+    assert!(reg.find("z-new").unwrap().is_active(), "{}", log.dump());
+    assert!(reg.find("a-old").is_none(), "{}", log.dump());
+    assert!(
+        log.has("a-old: E_REPLACED: replaced by z-new"),
+        "{}",
+        log.dump()
+    );
+    assert!(reg.find("b-kept").unwrap().is_active(), "{}", log.dump());
+    assert!(reg.find("y-other").unwrap().is_active());
+    assert!(!reg.find("x-broken").unwrap().is_active());
+    assert!(reg.find("c-fallback").unwrap().is_active(), "{}", log.dump());
+    assert!(!log.has("c-fallback: E_REPLACED"));
+    let _ = std::fs::remove_dir_all(&root);
+}

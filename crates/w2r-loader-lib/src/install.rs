@@ -38,6 +38,19 @@ pub fn pending_approvals(state: &State, entry: &VersionEntry) -> Vec<String> {
         .collect()
 }
 
+/// The installed, enabled plugins that `manifest` replaces (its `replaces` list, matched by id and
+/// version). Installing an enabled plugin disables these in the same `state.json` write; the host
+/// also refuses them at load (`E_REPLACED`), so this keeps the plugin list honest rather than
+/// being the only guard. Callers can use it to tell the user what is about to be switched off.
+pub fn replaced_ids(state: &State, manifest: &w2r_formats::manifest::Manifest) -> Vec<String> {
+    state
+        .plugins
+        .iter()
+        .filter(|p| p.enabled && manifest.replaces_plugin(&p.id, &p.version))
+        .map(|p| p.id.clone())
+        .collect()
+}
+
 /// Installs or updates one plugin from a downloaded package.
 ///
 /// `approved_now` is what the user just agreed to; every capability from `pending_approvals`
@@ -91,7 +104,15 @@ pub fn install(
         sha256: extracted.entry_sha256,
         approved_capabilities: entry.manifest.capabilities.clone(),
     };
+    let enabled = new_state.enabled;
     upsert(&mut state, new_state);
+    if enabled {
+        for old in replaced_ids(&state, &entry.manifest) {
+            if let Some(p) = state.plugins.iter_mut().find(|p| p.id == old) {
+                p.enabled = false;
+            }
+        }
+    }
     match root.save_state(&state) {
         Ok(()) => {
             swap.commit();
@@ -325,6 +346,38 @@ mod tests {
 
     fn id() -> Id<'static> {
         Id::new("example-plugin").unwrap()
+    }
+
+    #[test]
+    fn replaced_ids_lists_enabled_matching_plugins_only() {
+        use w2r_formats::manifest::{Dependency, validate};
+        use w2r_formats::semver::VersionReq;
+
+        let (mut e, _) = package("1.0.0", &[], b"dll");
+        e.manifest.replaces = vec![Dependency {
+            id: "old-plugin".into(),
+            version_req: VersionReq::parse("<1.0.0").unwrap(),
+        }];
+        let _ = validate; // the parser side is covered by docs/vectors/manifest.json
+        let plugin = |id: &str, version: &str, enabled: bool| PluginState {
+            id: id.into(),
+            version: Version::parse(version).unwrap(),
+            enabled,
+            sha256: [0; 32],
+            approved_capabilities: vec![],
+        };
+        let mut state = State::default();
+        state.plugins = vec![
+            plugin("old-plugin", "0.2.0", true),
+            plugin("other-plugin", "0.2.0", true),
+        ];
+        assert_eq!(replaced_ids(&state, &e.manifest), vec!["old-plugin"]);
+        // Out of the version range, or already disabled: left alone.
+        state.plugins[0].version = Version::parse("1.0.0").unwrap();
+        assert!(replaced_ids(&state, &e.manifest).is_empty());
+        state.plugins[0].version = Version::parse("0.2.0").unwrap();
+        state.plugins[0].enabled = false;
+        assert!(replaced_ids(&state, &e.manifest).is_empty());
     }
 
     #[test]

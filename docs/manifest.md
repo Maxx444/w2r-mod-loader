@@ -37,7 +37,7 @@ The rules below are normative; `tools/w2r_spec/manifest.py` is the executable re
 
 ## Fields
 
-All twelve fields are required. No other fields are allowed.
+Twelve fields are required and one is optional (`replaces`, below). No other fields are allowed.
 
 | Field | Type | Rule | Reason code |
 |---|---|---|---|
@@ -53,6 +53,7 @@ All twelve fields are required. No other fields are allowed.
 | `capabilities` | array | duplicate-free subset of `game.read`, `chat.read`, `chat.write`, `net.send`, `hooks.raw` | `bad_capability`, `bad_type` |
 | `affects_simulation` | boolean | must be a JSON boolean (`1` is refused) | `bad_type` |
 | `dependencies` | array | at most 16 objects, see below | `bad_dependency`, `bad_type` |
+| `replaces` | array | optional; same entries as `dependencies`, see below | `bad_replaces`, `bad_type` |
 
 Notes:
 
@@ -71,6 +72,15 @@ Notes:
   rule (device names included), is not the plugin's own id and does not repeat. `version_req` is 1
   to 4 comparators `(>=|<=|>|<|=)MAJOR.MINOR.PATCH` joined by `,` with no spaces, for example
   `>=1.0.0,<2.0.0`; numbers have no leading zeros and are at most 4,294,967,295.
+- **`replaces`** (optional, absent means none) lists plugins this one supersedes, for a rename, a
+  merge or a successor. Entries have the same shape and rules as `dependencies` (`id`,
+  `version_req`, at most 16, no repeats, not the plugin's own id), and an id may not appear in both
+  lists. `version_req` says which versions of the old plugin are replaced, so a cap such as
+  `<1.0.0` is written here, on the new plugin: a published plugin version never changes, so the
+  old one cannot carry it. Any problem is `bad_replaces` (`bad_type` if it is not an array). The
+  host skips a replaced plugin once its replacer has loaded (`E_REPLACED`,
+  [load-policy.md](load-policy.md)), and the manager disables it when the replacer is installed
+  enabled. A loader older than this field refuses the manifest as `unknown_field`.
 
 ## Reason codes
 
@@ -84,8 +94,8 @@ then each field in the order of the table above.
 | `not_json` | invalid UTF-8 or JSON, BOM, `NaN`, runaway nesting |
 | `duplicate_key` | an object repeats a key |
 | `not_object` | top level is not an object |
-| `unknown_field` / `missing_field` | field set differs from the twelve fields |
-| `bad_schema`, `bad_id`, `bad_version`, `bad_entry`, `bad_abi`, `bad_build`, `bad_capability`, `bad_dependency` | that field violates its rule |
+| `unknown_field` / `missing_field` | a required field is missing or one outside the thirteen is present |
+| `bad_schema`, `bad_id`, `bad_version`, `bad_entry`, `bad_abi`, `bad_build`, `bad_capability`, `bad_dependency`, `bad_replaces` | that field violates its rule |
 | `bad_type` | wrong JSON type for a container or boolean field |
 | `bad_string` | empty, or contains a control character |
 | `too_long` | string over its byte limit |
