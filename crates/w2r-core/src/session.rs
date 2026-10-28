@@ -1149,6 +1149,8 @@ fn start() -> Session {
         #[cfg(target_arch = "x86")]
         crate::hudpanel::install(&symbols, &*log);
         #[cfg(target_arch = "x86")]
+        crate::scorebars::install(image, &symbols, &*log);
+        #[cfg(target_arch = "x86")]
         crate::apm::install(image, &symbols, &*log);
         #[cfg(target_arch = "x86")]
         crate::netpanel::install(&symbols, &*log);
