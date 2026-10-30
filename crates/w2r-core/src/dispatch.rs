@@ -89,13 +89,14 @@ impl Registry {
         path: &std::path::Path,
         pin: &[u8; 32],
         caps: &[&str],
+        replaces: Vec<String>,
     ) -> Result<usize, LoadError> {
         let dll = crate::loader::load(path, pin).inspect_err(|e| {
             self.shared.log.line(W2R_LOG_ERROR, id, &e.to_string());
         })?;
         let entry = dll.entry;
         self.modules.push(dll);
-        self.load_entry_with_caps(id, entry, caps)
+        self.load_entry_replacing(id, entry, caps, replaces)
     }
 
     /// [`Registry::load_entry_with_caps`] with only the implicit capabilities.
@@ -112,10 +113,23 @@ impl Registry {
         entry: W2rPluginMain,
         caps: &[&str],
     ) -> Result<usize, LoadError> {
+        self.load_entry_replacing(id, entry, caps, Vec::new())
+    }
+
+    /// [`Registry::load_entry_with_caps`] for a plugin whose manifest `replaces` the plugins
+    /// `replaces` (by id): it may read their stored settings (`replaced_setting_get_i64`).
+    pub fn load_entry_replacing(
+        &mut self,
+        id: &str,
+        entry: W2rPluginMain,
+        caps: &[&str],
+        replaces: Vec<String>,
+    ) -> Result<usize, LoadError> {
         let index = self.slots.len();
         self.slots
             .push(Slot::new(index, id, caps, self.shared.clone()));
         let slot = &self.slots[index];
+        slot.set_replaces(replaces);
         let host = slot.host();
 
         // Copy the table inside the guard: a garbage pointer faults here, not later.
@@ -609,7 +623,10 @@ mod tests {
         let State::Disabled { reason } = reg.find("crashes").unwrap().state() else {
             panic!("still active")
         };
-        assert!(reason.starts_with("on_event(9): access violation"), "{reason}");
+        assert!(
+            reason.starts_with("on_event(9): access violation"),
+            "{reason}"
+        );
         reg.settings_changed(reg.find("crashes").unwrap());
         assert!(reg.find("listens").unwrap().is_active());
     }
@@ -632,7 +649,7 @@ mod tests {
         let (mut reg, log) = registry();
         let i = reg.load_entry("p", entry).unwrap();
         let h = unsafe { &*reg.slot(i).host() };
-        assert_eq!(h.struct_size, W2R_HOST_SETTINGS_DECLARE_SIZE);
+        assert_eq!(h.struct_size, W2R_HOST_REPLACED_SETTING_SIZE);
         assert_eq!(h.abi_version, W2R_ABI_VERSION);
 
         let long = "x".repeat(W2R_MAX_LOG_BYTES as usize + 1);

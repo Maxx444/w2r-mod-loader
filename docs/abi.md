@@ -151,6 +151,20 @@ sends the plugin `W2R_EVT_SETTINGS_CHANGED`, once per apply, after all of that p
 values are stored. A plugin that subscribed to it re-reads its settings there. Values the plugin
 stores itself with `settings_set_*` are what the screen shows the next time it opens.
 
+## Settings of a replaced plugin
+
+Appended after `settings_declare` (`host->struct_size >= W2R_HOST_REPLACED_SETTING_SIZE`; an
+older host has a smaller table). Implicit, no capability.
+
+- `replaced_setting_get_i64(token, id, key, out)`: reads a whole number that the plugin `id`
+  stored, so a plugin that supersedes it (`replaces` in its manifest,
+  [manifest.md](manifest.md)) can carry a player's choice over, typically once on first load.
+  `id` must be in the calling plugin's `replaces` list (by id; the entry's `version_req` is not
+  checked here), else `W2R_E_DENIED`. Read only: the old plugin's `config\<id>.json` is read
+  each call and never written or kept. Only stored values count, not the old plugin's declared
+  defaults: nothing stored under `key` is `W2R_E_NOT_FOUND`, a string there is `W2R_E_INVALID`.
+  It works whether or not the old plugin is loaded (once replaced it usually is not).
+
 ## Create screen
 
 Appended after the first release (`host->struct_size >= W2R_HOST_CREATE_UI_SIZE`, `W2R_HOST_CREATE_UI_SIZE` in the header; an older host has a smaller table). Implicit, no capability: the plugin

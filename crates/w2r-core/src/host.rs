@@ -156,6 +156,9 @@ pub struct Slot {
     /// What the plugin declared with `settings_declare`, in order. Its `category` is empty
     /// where the plugin named none; the session fills the plugin's display name in.
     declared: RefCell<Vec<SettingDef>>,
+    /// The ids in the plugin's manifest `replaces`: whose stored settings
+    /// `replaced_setting_get_i64` may read. Set before `on_load`.
+    replaces: RefCell<Vec<String>>,
     shared: Rc<Shared>,
     host: W2rHost,
 }
@@ -186,12 +189,18 @@ impl Slot {
             create_ui: Cell::new(None),
             loading: Cell::new(false),
             declared: RefCell::new(Vec::new()),
+            replaces: RefCell::new(Vec::new()),
             shared,
             host: host_table(core::ptr::null_mut()),
         });
         let token: *mut Slot = &mut *slot;
         slot.host.token = token.cast();
         slot
+    }
+
+    /// The plugins this one replaces (manifest `replaces`, by id), before `on_load` runs.
+    pub fn set_replaces(&self, ids: Vec<String>) {
+        *self.replaces.borrow_mut() = ids;
     }
 
     /// docs/abi.md: callbacks over this are logged...
@@ -325,7 +334,7 @@ impl Slot {
 
 fn host_table(token: *mut c_void) -> W2rHost {
     W2rHost {
-        struct_size: W2R_HOST_SETTINGS_DECLARE_SIZE,
+        struct_size: W2R_HOST_REPLACED_SETTING_SIZE,
         abi_version: W2R_ABI_VERSION,
         token,
         log: cb::log,
@@ -351,6 +360,7 @@ fn host_table(token: *mut c_void) -> W2rHost {
         create_map_select: cb::create_map_select,
         create_map_folder: cb::create_map_folder,
         settings_declare: cb::settings_declare,
+        replaced_setting_get_i64: cb::replaced_setting_get_i64,
     }
 }
 
@@ -1097,6 +1107,54 @@ mod cb {
         })
     }
 
+    /// A stored whole number of a plugin the caller replaces, read from its `config\<id>.json`
+    /// without keeping or writing it.
+    pub unsafe extern "C" fn replaced_setting_get_i64(
+        token: *mut c_void,
+        id_: W2rStr,
+        key_: W2rStr,
+        out: *mut i64,
+    ) -> W2rStatus {
+        run(|| {
+            let slot = match enter(token) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            if out.is_null() || id_.len > 64 {
+                return W2R_E_INVALID;
+            }
+            let id = match unsafe { text(id_) } {
+                Ok(id) => id,
+                Err(e) => return e,
+            };
+            let k = match key(key_) {
+                Ok(k) => k,
+                Err(e) => return e,
+            };
+            // Only an id from the caller's own manifest; manifest ids are path-safe.
+            if !slot.replaces.borrow().iter().any(|r| r == id) || !crate::manifest::is_valid_id(id)
+            {
+                return W2R_E_DENIED;
+            }
+            let Some(root) = slot.shared.services.root.as_ref() else {
+                return W2R_E_STATE;
+            };
+            let (settings, warning) =
+                Settings::open(root.join("config").join(format!("{id}.json")));
+            if let Some(w) = warning {
+                slot.log(W2R_LOG_WARN, &format!("{id}'s settings: {w}"));
+            }
+            match settings.get(k) {
+                Some(Val::Int(i)) => {
+                    unsafe { *out = *i };
+                    W2R_OK
+                }
+                Some(Val::Str(_)) => W2R_E_INVALID,
+                None => W2R_E_NOT_FOUND,
+            }
+        })
+    }
+
     /// Copies the value without a terminator. `len_out` always receives the full length; a
     /// value longer than `cap` leaves `buf` untouched and returns `W2R_E_LIMIT`.
     pub unsafe extern "C" fn settings_get_str(
@@ -1611,6 +1669,89 @@ mod tests {
                 W2R_E_NOT_FOUND
             );
         }
+    }
+
+    #[test]
+    fn a_replacer_reads_the_replaced_plugins_stored_numbers_only() {
+        static T: W2rPlugin = W2rPlugin {
+            struct_size: W2R_PLUGIN_V1_SIZE,
+            on_load: Some(ok_load),
+            on_event: None,
+            on_ui: None,
+            on_unload: None,
+        };
+        unsafe extern "C" fn ok_load(_: *const W2rHost) -> W2rStatus {
+            W2R_OK
+        }
+        unsafe extern "C" fn entry(_: *const W2rHost) -> *const W2rPlugin {
+            &T
+        }
+        let (mut reg, root) = registry_with_root("replaced");
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config").join("w2r-black-recolor.json"),
+            r#"{"schema":1,"values":{"black":2,"name":"pink"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config").join("w2r-chat.json"),
+            r#"{"schema":1,"values":{"lines":9}}"#,
+        )
+        .unwrap();
+        let i = reg
+            .load_entry_replacing(
+                "w2r-unit-color",
+                entry,
+                &[],
+                vec!["w2r-black-recolor".into()],
+            )
+            .unwrap();
+        let other = reg.load_entry("w2r-other", entry).unwrap();
+        let h = unsafe { &*reg.slot(i).host() };
+        assert_eq!(h.struct_size, W2R_HOST_REPLACED_SETTING_SIZE);
+        let mut n = 0i64;
+        unsafe {
+            let get = h.replaced_setting_get_i64;
+            assert_eq!(
+                get(h.token, s("w2r-black-recolor"), s("black"), &mut n),
+                W2R_OK
+            );
+            assert_eq!(n, 2);
+            assert_eq!(
+                get(h.token, s("w2r-black-recolor"), s("name"), &mut n),
+                W2R_E_INVALID
+            );
+            assert_eq!(
+                get(h.token, s("w2r-black-recolor"), s("missing"), &mut n),
+                W2R_E_NOT_FOUND
+            );
+            // Not in this plugin's `replaces`, though the file is there.
+            assert_eq!(
+                get(h.token, s("w2r-chat"), s("lines"), &mut n),
+                W2R_E_DENIED
+            );
+            assert_eq!(
+                get(
+                    h.token,
+                    s("w2r-black-recolor"),
+                    s("black"),
+                    core::ptr::null_mut()
+                ),
+                W2R_E_INVALID
+            );
+            // A plugin that replaces nothing reads nothing.
+            let ho = &*reg.slot(other).host();
+            assert_eq!(
+                (ho.replaced_setting_get_i64)(ho.token, s("w2r-black-recolor"), s("black"), &mut n),
+                W2R_E_DENIED
+            );
+        }
+        // Read only: the replaced plugin's file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("config").join("w2r-black-recolor.json")).unwrap(),
+            r#"{"schema":1,"values":{"black":2,"name":"pink"}}"#
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn registry_with_root(tag: &str) -> (Registry, std::path::PathBuf) {

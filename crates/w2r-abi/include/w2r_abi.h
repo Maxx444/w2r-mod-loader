@@ -249,11 +249,20 @@ typedef struct W2rHost {
        screen, which edits it for the plugin; W2R_EVT_SETTINGS_CHANGED says when it did. A declared
        key that was never stored reads as its default. */
     W2rStatus (W2R_CALL *settings_declare)(void *token, const W2rSettingDef *def);
+
+    /* Appended after settings_declare: check host->struct_size >= W2R_HOST_REPLACED_SETTING_SIZE.
+       Reads a whole-number setting stored by a plugin this one replaces (`id` is in the `replaces`
+       list of the caller's manifest). Read only, stored values only (no declared default).
+       W2R_E_DENIED: id not in the caller's replaces; W2R_E_NOT_FOUND: nothing stored under key;
+       W2R_E_INVALID: a string is stored there. */
+    W2rStatus (W2R_CALL *replaced_setting_get_i64)(void *token, W2rStr id, W2rStr key,
+                                                   int64_t *out);
 } W2rHost;
 
 #define W2R_HOST_CREATE_UI_SIZE (offsetof(W2rHost, create_map_select) + sizeof(void *))
 #define W2R_HOST_MAP_FOLDER_SIZE (offsetof(W2rHost, create_map_folder) + sizeof(void *))
 #define W2R_HOST_SETTINGS_DECLARE_SIZE (offsetof(W2rHost, settings_declare) + sizeof(void *))
+#define W2R_HOST_REPLACED_SETTING_SIZE (offsetof(W2rHost, replaced_setting_get_i64) + sizeof(void *))
 
 /* ---- plugin table: returned by the plugin ---------------------------------------------- */
 typedef struct W2rPlugin {

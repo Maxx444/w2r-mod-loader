@@ -80,7 +80,9 @@ Notes:
   old one cannot carry it. Any problem is `bad_replaces` (`bad_type` if it is not an array). The
   host skips a replaced plugin once its replacer has loaded (`E_REPLACED`,
   [load-policy.md](load-policy.md)), and the manager disables it when the replacer is installed
-  enabled. A loader older than this field refuses the manifest as `unknown_field`.
+  enabled. A loader older than this field refuses the manifest as `unknown_field`. The replacer may
+  read the replaced plugin's stored whole-number settings with `replaced_setting_get_i64`
+  ([abi.md](abi.md), "Settings of a replaced plugin").
 
 ## Reason codes
 

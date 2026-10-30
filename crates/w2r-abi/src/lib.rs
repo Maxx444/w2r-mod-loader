@@ -305,11 +305,8 @@ pub struct W2rHost {
     ) -> W2rStatus,
     /// Only inside the create-screen callback. Counts the maps of the host's map index with
     /// `players` maximum players (0 = any). `W2R_E_BUSY` while the index is being built.
-    pub create_map_count: unsafe extern "C" fn(
-        token: *mut c_void,
-        players: u32,
-        count_out: *mut u32,
-    ) -> W2rStatus,
+    pub create_map_count:
+        unsafe extern "C" fn(token: *mut c_void, players: u32, count_out: *mut u32) -> W2rStatus,
     /// Only inside the create-screen callback. Makes the `nth` (0-based, in index order) map with
     /// `players` maximum players (0 = any) the screen's selected map.
     pub create_map_select:
@@ -331,6 +328,19 @@ pub struct W2rHost {
     /// through `W2R_EVT_SETTINGS_CHANGED`. docs/abi.md, "Declared settings".
     pub settings_declare:
         unsafe extern "C" fn(token: *mut c_void, def: *const W2rSettingDef) -> W2rStatus,
+
+    // Appended after `settings_declare`: check `struct_size >= W2R_HOST_REPLACED_SETTING_SIZE`.
+    /// Reads a whole-number setting stored by a plugin this one replaces (`id` is in the
+    /// `replaces` list of the calling plugin's manifest), so a successor can carry a player's
+    /// choice over. Read only, and only what was stored: no declared default. `W2R_E_DENIED` when
+    /// `id` is not in the caller's `replaces`, `W2R_E_NOT_FOUND` when nothing is stored under
+    /// `key`, `W2R_E_INVALID` when a string is. docs/abi.md, "Settings of a replaced plugin".
+    pub replaced_setting_get_i64: unsafe extern "C" fn(
+        token: *mut c_void,
+        id: W2rStr,
+        key: W2rStr,
+        out: *mut i64,
+    ) -> W2rStatus,
 }
 
 // ---- declared settings ----------------------------------------------------------------------
@@ -422,7 +432,10 @@ pub const W2R_HOST_CREATE_UI_SIZE: u32 =
 pub const W2R_HOST_MAP_FOLDER_SIZE: u32 =
     (core::mem::offset_of!(W2rHost, create_map_folder) + core::mem::size_of::<usize>()) as u32;
 /// `struct_size` of a host that also has `settings_declare`.
-pub const W2R_HOST_SETTINGS_DECLARE_SIZE: u32 = core::mem::size_of::<W2rHost>() as u32;
+pub const W2R_HOST_SETTINGS_DECLARE_SIZE: u32 =
+    (core::mem::offset_of!(W2rHost, settings_declare) + core::mem::size_of::<usize>()) as u32;
+/// `struct_size` of a host that also has `replaced_setting_get_i64`.
+pub const W2R_HOST_REPLACED_SETTING_SIZE: u32 = core::mem::size_of::<W2rHost>() as u32;
 
 // Mirrors tests/abi_layout.c. Keep both in sync.
 const _: () = {
@@ -444,7 +457,9 @@ const _: () = {
     assert!(offset_of!(W2rSettingDef, flags) == 32);
     assert!(offset_of!(W2rSettingDef, choices) == 40);
     assert!(offset_of!(W2rSettingDef, key) == if size_of::<usize>() == 4 { 48 } else { 56 });
-    assert!(offset_of!(W2rSettingDef, active_when) == if size_of::<usize>() == 4 { 96 } else { 152 });
+    assert!(
+        offset_of!(W2rSettingDef, active_when) == if size_of::<usize>() == 4 { 96 } else { 152 }
+    );
     // Option<fn> must be pointer-sized with NULL as None for the plugin table to match C.
     assert!(size_of::<Option<unsafe extern "C" fn()>>() == size_of::<*const c_void>());
 };
@@ -454,7 +469,7 @@ mod tests {
     use super::*;
     use core::mem::size_of;
 
-    // The game target. 23 host function pointers after a 12-byte header.
+    // The game target. 24 host function pointers after a 12-byte header.
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn sizes_match_the_c_header_on_x86() {
@@ -465,12 +480,13 @@ mod tests {
         assert_eq!(W2R_UI_TEXT_EDIT_SIZE, 32);
         assert_eq!(W2R_UI_COLOR_EDIT_SIZE, 36);
         assert_eq!(W2R_UI_COMBO_SIZE, 40);
-        assert_eq!(size_of::<W2rHost>(), 104);
+        assert_eq!(size_of::<W2rHost>(), 108);
         assert_eq!(W2R_HOST_V1_SIZE, 84);
         assert_eq!(W2R_PLUGIN_V1_SIZE, 20);
         assert_eq!(W2R_HOST_CREATE_UI_SIZE, 96);
         assert_eq!(W2R_HOST_MAP_FOLDER_SIZE, 100);
         assert_eq!(W2R_HOST_SETTINGS_DECLARE_SIZE, 104);
+        assert_eq!(W2R_HOST_REPLACED_SETTING_SIZE, 108);
         assert_eq!(size_of::<W2rSettingDef>(), 104);
     }
 
@@ -483,7 +499,7 @@ mod tests {
         assert_eq!(size_of::<W2rPlugin>(), 40);
         assert_eq!(size_of::<W2rUi>(), 80);
         assert_eq!(W2R_UI_TEXT_EDIT_SIZE, 64);
-        assert_eq!(size_of::<W2rHost>(), 200);
+        assert_eq!(size_of::<W2rHost>(), 208);
         assert_eq!(W2R_HOST_MAP_FOLDER_SIZE, 192);
         assert_eq!(size_of::<W2rSettingDef>(), 168);
     }

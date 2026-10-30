@@ -71,7 +71,7 @@ fn registry() -> (Registry, Rc<Lines>) {
 
 fn load(reg: &mut Registry, id: &str, path: &Path) -> Result<usize, LoadError> {
     let pin = sha256_of(path).expect("hash fixture");
-    reg.load_dll(id, path, &pin, &[])
+    reg.load_dll(id, path, &pin, &[], Vec::new())
 }
 
 #[test]
@@ -137,13 +137,13 @@ fn entry_and_load_failures_are_refused_with_the_spec_codes() {
 
     let missing = fixtures().join("does_not_exist.dll");
     let err = reg
-        .load_dll("missing", &missing, &[0u8; 32], &[])
+        .load_dll("missing", &missing, &[0u8; 32], &[], Vec::new())
         .unwrap_err();
     assert_eq!(err.code, "E_ENTRY");
     assert!(err.detail.starts_with("cannot open"), "{err}");
 
     let err = reg
-        .load_dll("badpin", &dll("basic_plugin"), &[0u8; 32], &[])
+        .load_dll("badpin", &dll("basic_plugin"), &[0u8; 32], &[], Vec::new())
         .unwrap_err();
     assert_eq!(err.code, "E_HASH");
     assert!(err.detail.contains("differs from pin 0000"), "{err}");

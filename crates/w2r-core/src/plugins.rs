@@ -305,8 +305,9 @@ pub fn load_all(
         // Grant what the manifest declares (a subset of the approvals after check 6), not the
         // approval list: a stale approval from an older version must not widen the plugin.
         let caps: Vec<&str> = c.manifest.capabilities.iter().map(String::as_str).collect();
+        let replaces = c.manifest.replaces.iter().map(|r| r.id.clone()).collect();
         if registry
-            .load_dll(&c.st.id, &c.dll, &c.st.sha256, &caps)
+            .load_dll(&c.st.id, &c.dll, &c.st.sha256, &caps, replaces)
             .is_ok()
         {
             loaded.insert(c.st.id.clone(), c.manifest.version.clone());
