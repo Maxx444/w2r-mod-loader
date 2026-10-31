@@ -8,10 +8,13 @@
 //! does this without the mod loader too.
 //!
 //! Leaving a match to the menu loses the choice too, for both F5 and the button, with or without
-//! the mod loader (Maxx444's test, 2026-10-31). Where the game resets it is not known yet, so
-//! this also remembers the last choice made with a toggle, logs every change of the mode and the
-//! bit (lines start with "graphics:"), puts the bit back when something else changes it, and sets
-//! it again just before `PersistSettings` writes Warcraft2.ini.
+//! the mod loader (Maxx444's test, 2026-10-31). The log of that test showed the bit stays right
+//! in memory all the way to the exit and `PersistSettings` is never called, yet the next launch
+//! read the old value: on that path Warcraft2.ini is evidently not written with it. So a toggle
+//! now writes the ini at once, through `PersistSettings`, whatever way the game is left later.
+//! It also remembers the last choice, logs every change of the mode and the bit (lines start with
+//! "graphics:"), puts the bit back when something else changes it, and sets it again just before
+//! `PersistSettings` writes.
 
 /// Bit of `GameSettingsFlags` that starts the next launch in classic graphics.
 pub const CLASSIC_BIT: u32 = 0x10;
@@ -98,6 +101,8 @@ mod win {
 
     static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
     static PERSIST_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    /// `PersistSettings` itself (through the hook), once hooked; 0 before.
+    static PERSIST_TARGET: AtomicUsize = AtomicUsize::new(0);
     static MODE: AtomicUsize = AtomicUsize::new(0);
     static FLAGS: AtomicUsize = AtomicUsize::new(0);
     /// The player's last choice (`CHOSEN_*`), from a toggle this session.
@@ -140,6 +145,15 @@ mod win {
                             next_launch_text(after)
                         ));
                     }
+                }
+                // Write Warcraft2.ini now: leaving the match to the menu and then the game does
+                // not write it.
+                let target = PERSIST_TARGET.load(Ordering::Acquire);
+                if target != 0 {
+                    // SAFETY: the hooked PersistSettings, cdecl `void()`, on the game's thread
+                    // (the game's options screen calls it during a match too).
+                    let persist: PersistFn = unsafe { core::mem::transmute(target) };
+                    unsafe { persist() };
                 }
             }));
         }
@@ -232,11 +246,14 @@ mod win {
             )
         };
         match result {
-            Ok(_) => log.line(
-                W2R_LOG_INFO,
-                "host",
-                &format!("hooked {PERSIST} @ {target:#010x} (keeps the graphics choice)"),
-            ),
+            Ok(_) => {
+                PERSIST_TARGET.store(target, Ordering::Release);
+                log.line(
+                    W2R_LOG_INFO,
+                    "host",
+                    &format!("hooked {PERSIST} @ {target:#010x} (keeps the graphics choice)"),
+                );
+            }
             Err(e) => log.line(
                 W2R_LOG_ERROR,
                 "host",
